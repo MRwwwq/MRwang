@@ -1,0 +1,49 @@
+# ==================== 敏感凭据 ====================
+config.py                       # Tushare Token + PG密码
+_config.py                      # 备选配置
+.env                            # 环境变量
+*.pem                           # SSL证书
+*.key                           # SSH私钥
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+
+# ==================== 运行时数据 ====================
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+logs/
+memory_backup/
+memory/
+faiss_index/*.npy
+faiss_index/*.json
+guba_data/
+analysis_snapshots/
+param_snapshots/
+weight_snapshots/
+review_report/
+reviews/
+reports/
+test_reports/
+sandbox_results/
+evolution_log/
+model/
+
+# ==================== 临时 / 系统 ====================
+_tmp/
+snapshots/
+solid_state_archive/
+phase_reports/
+pdf_monitor/
+network_config/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
