@@ -1,0 +1,116 @@
+{
+  "date": "20260723",
+  "mode": "pre",
+  "data": [
+    {
+      "code": "000651.SZ",
+      "name": "格力电器",
+      "close": 40.57,
+      "pct_chg": -0.7097,
+      "pe_ttm": 7.2,
+      "net_15d": 34.96,
+      "net_3d": 8.55,
+      "fund_status": "🟢大幅流入",
+      "trend": "🟢多头"
+    },
+    {
+      "code": "601766.SH",
+      "name": "中国中车",
+      "close": 6.0,
+      "pct_chg": 0.1669,
+      "pe_ttm": 11.3,
+      "net_15d": 25.51,
+      "net_3d": 12.11,
+      "fund_status": "🟢大幅流入",
+      "trend": "🟢多头"
+    },
+    {
+      "code": "600887.SH",
+      "name": "伊利股份",
+      "close": 27.23,
+      "pct_chg": -0.5478,
+      "pe_ttm": 12.7,
+      "net_15d": 18.66,
+      "net_3d": 7.85,
+      "fund_status": "🟢大幅流入",
+      "trend": "🟢多头"
+    },
+    {
+      "code": "601919.SH",
+      "name": "中远海控",
+      "close": 15.27,
+      "pct_chg": 0.8587,
+      "pe_ttm": 8.0,
+      "net_15d": 20.9,
+      "net_3d": 7.58,
+      "fund_status": "🟢大幅流入",
+      "trend": "🟢多头"
+    },
+    {
+      "code": "600031.SH",
+      "name": "三一重工",
+      "close": 19.97,
+      "pct_chg": 0.6045,
+      "pe_ttm": 19.0,
+      "net_15d": 18.19,
+      "net_3d": 8.23,
+      "fund_status": "🟢大幅流入",
+      "trend": "🟢多头"
+    },
+    {
+      "code": "600884.SH",
+      "name": "杉杉股份",
+      "close": 12.75,
+      "pct_chg": 1.7558,
+      "pe_ttm": 40.3,
+      "net_15d": -7.39,
+      "net_3d": 1.35,
+      "fund_status": "🔴大幅流出",
+      "trend": "🟡震荡"
+    },
+    {
+      "code": "600547.SH",
+      "name": "山东黄金",
+      "close": 27.42,
+      "pct_chg": 0.073,
+      "pe_ttm": 20.7,
+      "net_15d": -0.04,
+      "net_3d": 3.36,
+      "fund_status": "🟡小幅流出",
+      "trend": "🟡震荡"
+    },
+    {
+      "code": "002044.SZ",
+      "name": "美年健康",
+      "close": 4.49,
+      "pct_chg": 1.1261,
+      "pe_ttm": 65.2,
+      "net_15d": -5.33,
+      "net_3d": -1.01,
+      "fund_status": "🔴大幅流出",
+      "trend": "🔴空头"
+    },
+    {
+      "code": "300476.SZ",
+      "name": "胜宏科技",
+      "close": 238.93,
+      "pct_chg": -0.6115,
+      "pe_ttm": 68.6,
+      "net_15d": -18.13,
+      "net_3d": 10.12,
+      "fund_status": "🔴大幅流出",
+      "trend": "🔴空头"
+    },
+    {
+      "code": "300433.SZ",
+      "name": "蓝思科技",
+      "close": 36.58,
+      "pct_chg": -0.5978,
+      "pe_ttm": 82.0,
+      "net_15d": 16.21,
+      "net_3d": 1.18,
+      "fund_status": "🟢大幅流入",
+      "trend": "🔴空头"
+    }
+  ]
+}

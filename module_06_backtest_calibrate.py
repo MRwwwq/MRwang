@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Module_06_BacktestCalibrate — 盘后样本校准与智能体自修正模块 v1.1
+Module_06_BacktestCalibrate — 盘后样本校准与智能体自修正模块 v1.2
 ================================================================
 核心定位：全链路闭环关键环节，驱动智能体自主修正规则/参数/信号打分权重的唯一数据源
 执行窗口：收盘后，标准时长10分钟
@@ -10,18 +10,21 @@ Module_06_BacktestCalibrate — 盘后样本校准与智能体自修正模块 v1
   2. 智能体盘中原始信号存档完整（含Layer2风控分级、psy_hit_codes心理编码）
   3. 交易者真实操作记录完整
 
-两大核心操作：
+三大核心操作：
   【操作一】真实交易结果校准（量化误差标签）: 4类标签 L01~L04 + L00正常
   【操作二】人工研判漏洞修正（补充隐性盲区）: 3类漏洞记录+补丁+等级标记+L1~L3
+  【操作三】人工限制参数进化边界（防过拟合、规则失控）: 5类参数硬边界+边界锁+过拟合风险分级
 
 流程：
-  归集→匹配4类标签→记录研判漏洞→写入样本库→同步回传Layer1/Module01~04/Layer2→生成复盘日志
+  归集→匹配4类标签→记录研判漏洞→写入进化边界→写入样本库→同步回传Layer1/Module01~04/Layer2→生成复盘日志
 
 用法:
   python3 module_06_backtest_calibrate.py                          # 交互模式(人工确认标签)
   python3 module_06_backtest_calibrate.py --auto                   # 自动模式(基于预判vs真实行情自动打标)
   python3 module_06_backtest_calibrate.py --vuln                   # 仅执行漏洞修正操作
   python3 module_06_backtest_calibrate.py --auto --vuln            # 全自动模式(含自动标记+漏洞修正)
+  python3 module_06_backtest_calibrate.py --boundary               # 仅执行参数进化边界设置
+  python3 module_06_backtest_calibrate.py --auto --vuln --boundary # 全三大操作一次完成
   python3 module_06_backtest_calibrate.py --check-only             # 仅检查今日是否已完成校准
 """
 
@@ -47,6 +50,7 @@ TRACKER_DIR = BASE / "tracker_reports"
 CALIB_TABLE = "module06_calibration"
 SYNC_TABLE = "module06_sync_log"
 VULN_TABLE = "module06_vulnerability"  # 研判漏洞记录表
+BOUNDARY_TABLE = "module06_evolution_boundary"  # 参数进化边界锁表
 
 # 交易日（从文件名或系统日期推断）
 TODAY = datetime.now().strftime("%Y-%m-%d")
@@ -125,6 +129,171 @@ VULN_SEVERITY = {
 
 
 # ═══════════════════════════════════════════
+#  第三部分：5类参数进化硬边界（防过拟合）
+# ═══════════════════════════════════════════
+
+# 5大类参数人工设定硬边界（智能体自动迭代时只能在区间内微调）
+BOUNDARY_RULES = {
+    "仓位类": {
+        "params": {
+            "total_position_max": {
+                "desc": "总仓上限全局天花板",
+                "baseline": "50%",
+                "hard_min": "20%",
+                "hard_max": "70%",
+                "unit": "百分比"
+            },
+            "total_position_min": {
+                "desc": "总仓上限全局最低底线",
+                "baseline": "30%",
+                "hard_min": "20%",
+                "hard_max": "50%",
+                "unit": "百分比"
+            },
+            "single_stock_position": {
+                "desc": "单只个股仓位",
+                "baseline": "15%",
+                "hard_min": "10%",
+                "hard_max": "30%",
+                "unit": "百分比"
+            },
+            "stop_loss_ratio": {
+                "desc": "单次止损容忍比例",
+                "baseline": "3%",
+                "hard_min": "2%",
+                "hard_max": "4%",
+                "unit": "百分比"
+            },
+        },
+        "module": "Module01_定风格",
+        "logic": "智能体自动优化仓位参数时，只能在人工划定区间内微调，不能出现总仓拉满100%、止损放宽至8%、单票满仓等极端过拟合参数"
+    },
+    "情绪判定阈值": {
+        "params": {
+            "freeze_floor_rate_min": {
+                "desc": "冰点最低封板率下限",
+                "baseline": "40%",
+                "hard_min": "30%",
+                "hard_max": "—",
+                "unit": "百分比"
+            },
+            "climax_floor_rate_max": {
+                "desc": "高潮封板率上限",
+                "baseline": "65%",
+                "hard_min": "—",
+                "hard_max": "75%",
+                "unit": "百分比"
+            },
+            "sentiment_position_floor": {
+                "desc": "情绪约束总仓不得低于（防极端空仓固化）",
+                "baseline": "20%",
+                "hard_min": "15%",
+                "hard_max": "—",
+                "unit": "百分比"
+            },
+        },
+        "module": "Module02_定情绪",
+        "logic": "模型不得把冰点阈值下调至极低数值；防止短期暴涨行情拟合后常态行情误判高潮；避免极端空仓固化"
+    },
+    "主线筛选权重": {
+        "params": {
+            "turnover_weight": {
+                "desc": "主线成交额权重",
+                "baseline": "0.5",
+                "hard_min": "0.2",
+                "hard_max": "0.7",
+                "unit": "系数"
+            },
+            "limit_up_count_weight": {
+                "desc": "涨停数量权重",
+                "baseline": "0.4",
+                "hard_min": "0.2",
+                "hard_max": "0.7",
+                "unit": "系数"
+            },
+            "thematic_duration_weight": {
+                "desc": "题材持续性打分权重",
+                "baseline": "0.5",
+                "hard_min": "0.2",
+                "hard_max": "0.7",
+                "unit": "系数"
+            },
+        },
+        "module": "Module03_04",
+        "logic": "单一指标权重最高不超过0.7、最低不低于0.2；禁止单一维度完全主导主线判定（过拟合短期涨停行情）；剔除黑名单过滤不能无限制放宽也不能一刀切；进场模式匹配权重浮动区间固定"
+    },
+    "Layer1向量打分权重": {
+        "params": {
+            "cos_similarity_weight": {
+                "desc": "向量cos相似度权重",
+                "baseline": "0.5",
+                "hard_min": "0.4",
+                "hard_max": "0.7",
+                "unit": "系数"
+            },
+            "keyword_weight": {
+                "desc": "关键词权重系数",
+                "baseline": "0.5",
+                "hard_min": "0.3",
+                "hard_max": "0.6",
+                "unit": "系数"
+            },
+            "new_keywords_daily_limit": {
+                "desc": "特征词新增每日上限",
+                "baseline": "10",
+                "hard_min": "—",
+                "hard_max": "20",
+                "unit": "个数"
+            },
+        },
+        "module": "Layer1_FeatureCheck",
+        "logic": "cos相似度模型不得自动上调至0.9或下调至0.1；关键词权重与cos权重之和永久固定为1；防止无限堆砌小众冷门特征词造成过拟合"
+    },
+    "风控心理偏差计数": {
+        "params": {
+            "red_trigger_min": {
+                "desc": "RED高风险触发条数下限",
+                "baseline": "25",
+                "hard_min": "20",
+                "hard_max": "—",
+                "unit": "条数"
+            },
+            "yellow_range_min": {
+                "desc": "YELLOW预警区间下限",
+                "baseline": "5",
+                "hard_min": "3",
+                "hard_max": "—",
+                "unit": "条数"
+            },
+            "yellow_range_max": {
+                "desc": "YELLOW预警区间上限",
+                "baseline": "20",
+                "hard_min": "—",
+                "hard_max": "22",
+                "unit": "条数"
+            },
+            "single_psy_code_weight_max": {
+                "desc": "单一心理编码触发权重上限",
+                "baseline": "0.3",
+                "hard_min": "—",
+                "hard_max": "0.4",
+                "unit": "系数"
+            },
+        },
+        "module": "Layer2_RiskDecision",
+        "logic": "RED触发下限固定≥20条，不能下调至5条造成频繁拦截；YELLOW区间固定3~22条禁止偏移；单一编码权重上限固定，不能因短期亏损无限放大某一类扣分"
+    },
+}
+
+# 过拟合风险等级
+BOUNDARY_SEVERITY = {
+    "L1": {"name": "低风险", "desc": "参数小幅偏移，边界宽松即可约束", "action": "保持默认边界区间即可"},
+    "L2": {"name": "中风险", "desc": "参数大幅偏移，需收紧上下限区间", "action": "临时收紧边界区间，次日恢复默认"},
+    "L3": {"name": "高风险", "desc": "参数极端偏移，锁定参数禁止当日迭代", "action": "锁定参数禁止自动迭代，沿用基准参数"},
+}
+
+
+# ═══════════════════════════════════════════
 #  数据库初始化
 # ═══════════════════════════════════════════
 
@@ -174,6 +343,24 @@ def init_db():
             fix_patch TEXT DEFAULT '',
             notes TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {BOUNDARY_TABLE} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            param_category TEXT NOT NULL,
+            param_name TEXT NOT NULL,
+            param_desc TEXT DEFAULT '',
+            baseline_value TEXT DEFAULT '',
+            hard_min TEXT DEFAULT '',
+            hard_max TEXT DEFAULT '',
+            actual_drift TEXT DEFAULT '',
+            validity TEXT DEFAULT '长期永久',
+            risk_level TEXT DEFAULT 'L1',
+            notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(trade_date, param_category, param_name)
         )
     """)
     conn.commit()
@@ -460,6 +647,457 @@ def integrity_check(trade_date: str, ticker_list: list) -> Tuple[bool, list]:
     return len(missing) == 0, missing
 
 
+# ═══════════════════════════════════════════
+#  操作三：参数进化边界设置（防过拟合）
+# ═══════════════════════════════════════════
+
+def generate_boundary_drift_report(trade_date: str) -> str:
+    """
+    步骤1：梳理当日自动调参产生的参数偏移幅度
+    对比昨日基准，生成全量参数浮动报告（基于BOUNDARY_RULES默认值模拟）
+    """
+    lines = [
+        "",
+        "#### 步骤1：参数偏移核查",
+        "",
+        "| 类别 | 参数名 | 基准值 | 硬性下限 | 硬性上限 | 当日实际 | 偏移幅度 | 状态 |",
+        "|:----:|:------:|:------:|:--------:|:--------:|:--------:|:--------:|:----:|",
+    ]
+    drift_count = 0
+    # 从数据库获取当天已有边界记录
+    conn = sqlite3.connect(str(MODULE06_DB))
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT param_category, param_name, baseline_value, hard_min, hard_max, actual_drift
+        FROM {BOUNDARY_TABLE} WHERE trade_date = ?
+    """, (trade_date,))
+    existing = {(r[0], r[1]): r for r in cur.fetchall()}
+    conn.close()
+
+    for cat_name, cat_info in BOUNDARY_RULES.items():
+        for pname, pinfo in cat_info["params"].items():
+            key = (cat_name, pname)
+            if key in existing:
+                # 已有当日记录，显示记录的数据
+                _, _, bl, hmin, hmax, drift = existing[key]
+                baseline_display = bl
+                hmin_display = hmin
+                hmax_display = hmax
+                drift_display = drift if drift else "—"
+            else:
+                baseline_display = pinfo["baseline"]
+                hmin_display = pinfo["hard_min"]
+                hmax_display = pinfo["hard_max"]
+                drift_display = "未核查"
+
+            status = "✅ 在界内" if drift_display in ("—", "未核查") else "⚠️ 偏离"
+            if drift_display not in ("—", "未核查"):
+                try:
+                    drift_val = float(drift_display.replace("%", "").replace("+", ""))
+                    hmin_val = float(hmin_display.replace("%", ""))
+                    hmax_val = float(hmax_display.replace("%", ""))
+                    if drift_val < hmin_val or drift_val > hmax_val:
+                        status = "❌ 超界"
+                        drift_count += 1
+                except:
+                    pass
+
+            lines.append(
+                f"| {cat_name} | {pinfo['desc']} | {baseline_display} "
+                f"| {hmin_display} | {hmax_display} | {drift_display} | {drift_display} | {status} |"
+            )
+
+    if drift_count == 0:
+        lines += ["", "✅ **所有参数在边界范围内，无显著偏移**"]
+    else:
+        lines += ["", f"⚠️ **{drift_count}项参数超界或偏移，需要人工核查边界设置**"]
+
+    return "\n".join(lines)
+
+
+def save_evolution_boundary(trade_date, param_category, param_name, param_desc,
+                            baseline_value, hard_min, hard_max, actual_drift="",
+                            validity="长期永久", risk_level="L1", notes=""):
+    """步骤2：保存参数进化边界设置"""
+    conn = sqlite3.connect(str(MODULE06_DB))
+    cur = conn.cursor()
+    cur.execute(f"""
+        INSERT OR REPLACE INTO {BOUNDARY_TABLE}
+        (trade_date, param_category, param_name, param_desc,
+         baseline_value, hard_min, hard_max, actual_drift,
+         validity, risk_level, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (trade_date, param_category, param_name, param_desc,
+          baseline_value, hard_min, hard_max, actual_drift,
+          validity, risk_level, notes))
+    conn.commit()
+    conn.close()
+    log.info(f"  [边界] [{param_category}] {param_name}: [{hard_min}~{hard_max}] {risk_level}")
+    return True
+
+
+def apply_boundary_locks(trade_date: str):
+    """
+    步骤3：将当日全部边界锁写入全局参数锁文件
+    系统启动时加载此文件，智能体自动调参逻辑强制受边界约束
+    """
+    conn = sqlite3.connect(str(MODULE06_DB))
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT param_category, param_name, hard_min, hard_max, param_desc, validity
+        FROM {BOUNDARY_TABLE}
+        WHERE trade_date = ? AND risk_level != 'L3'
+        ORDER BY param_category, param_name
+    """, (trade_date,))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        # 无自定义边界时，使用BOUNDARY_RULES默认值写锁
+        locks = {}
+        for cat_name, cat_info in BOUNDARY_RULES.items():
+            for pname, pinfo in cat_info["params"].items():
+                locks[f"{cat_name}.{pname}"] = {
+                    "desc": pinfo["desc"],
+                    "hard_min": pinfo["hard_min"],
+                    "hard_max": pinfo["hard_max"],
+                    "baseline": pinfo["baseline"],
+                    "unit": pinfo["unit"],
+                    "source": "BOUNDARY_RULES默认"
+                }
+        lock_path = BASE / f"config/param_boundary_locks_{TRADE_DATE}.json"
+        os.makedirs(str(lock_path.parent), exist_ok=True)
+        with open(lock_path, "w") as f:
+            json.dump({
+                "trade_date": trade_date,
+                "locks": locks,
+                "description": "参数进化硬边界锁 — 智能体自动调参不得突破此区间",
+                "rule": "边界锁优先级高于智能体自动调参逻辑，参数超出边界时边界数值强制覆盖"
+            }, f, ensure_ascii=False, indent=2)
+        log.info(f"  参数锁(默认): {len(locks)}项 → {lock_path}")
+        return lock_path, len(locks)
+
+    locks = {}
+    for r in rows:
+        cat, pname, hmin, hmax, desc, validity = r
+        key = f"{cat}.{pname}"
+        locks[key] = {
+            "desc": desc,
+            "hard_min": hmin,
+            "hard_max": hmax,
+            "validity": validity,
+            "source": f"人工设置({trade_date})"
+        }
+
+    lock_path = BASE / f"config/param_boundary_locks_{TRADE_DATE}.json"
+    os.makedirs(str(lock_path.parent), exist_ok=True)
+    with open(lock_path, "w") as f:
+        json.dump({
+            "trade_date": trade_date,
+            "locks": locks,
+            "description": "参数进化硬边界锁 — 智能体自动调参不得突破此区间",
+            "rule": "边界锁优先级高于智能体自动调参逻辑，参数超出边界时边界数值强制覆盖",
+            "extra": "L3高风险参数已排除（禁止当日迭代）"
+        }, f, ensure_ascii=False, indent=2)
+    log.info(f"  参数锁: {len(locks)}项 → {lock_path}")
+
+    conn = sqlite3.connect(str(MODULE06_DB))
+    cur = conn.cursor()
+    cur.execute(f"""
+        INSERT INTO {SYNC_TABLE}
+        (trade_date, ticker, target_module, sync_action, sync_status)
+        VALUES (?, ?, ?, ?, ?)
+    """, (trade_date, "", "全局参数边界锁",
+          f"apply_boundary_locks|{len(locks)}项|锁定区间防止过拟合", "completed"))
+    conn.commit()
+    conn.close()
+    return lock_path, len(locks)
+
+
+def record_overfitting_risk(trade_date: str, param_category: str, risk_level: str, notes: str = ""):
+    """步骤4：标记过拟合风险等级并归档（仅升级，不降级）"""
+    conn = sqlite3.connect(str(MODULE06_DB))
+    cur = conn.cursor()
+    # 仅当新等级 >= 现有等级时才更新（L3 > L2 > L1，不降级）
+    level_order = {"L1": 1, "L2": 2, "L3": 3}
+    new_order = level_order.get(risk_level, 1)
+    cur.execute(f"""
+        UPDATE {BOUNDARY_TABLE}
+        SET risk_level = ?,
+            notes = CASE WHEN notes = '' THEN ? ELSE notes || '; ' || ? END
+        WHERE trade_date = ?
+          AND param_category = ?
+          AND (CASE risk_level
+               WHEN 'L1' THEN 1 WHEN 'L2' THEN 2 WHEN 'L3' THEN 3 ELSE 1
+               END) <= ?
+    """, (risk_level, notes, notes, trade_date, param_category, new_order))
+    updated = cur.rowcount
+    conn.commit()
+    conn.close()
+    sev_info = BOUNDARY_SEVERITY.get(risk_level, {})
+    log.info(f"  [过拟合风险] [{risk_level}] {param_category}: {sev_info.get('name', '')} — {notes}")
+
+    # L3高风险→记录禁止迭代的同步事件
+    if risk_level == "L3":
+        conn = sqlite3.connect(str(MODULE06_DB))
+        cur = conn.cursor()
+        cur.execute(f"""
+            INSERT INTO {SYNC_TABLE}
+            (trade_date, ticker, target_module, sync_action, sync_status)
+            VALUES (?, ?, ?, ?, ?)
+        """, (trade_date, "", param_category,
+              f"LOCK_PARAMS_L3|禁止当日自动迭代，沿用基准参数|{notes}", "completed"))
+        conn.commit()
+        conn.close()
+
+
+def check_boundary_hit_days(trade_date: str, param_category: str = None) -> dict:
+    """
+    兜底机制：检查参数是否连续3日逼近边界极值
+    若连续3日触发，自动提醒人工重新评估调整边界区间
+    """
+    conn = sqlite3.connect(str(MODULE06_DB))
+    cur = conn.cursor()
+    if param_category:
+        cur.execute(f"""
+            SELECT trade_date, param_name, actual_drift, hard_min, hard_max
+            FROM {BOUNDARY_TABLE}
+            WHERE trade_date >= date(?, '-7 days') AND trade_date <= ?
+              AND param_category = ?
+            ORDER BY trade_date DESC
+        """, (trade_date, trade_date, param_category))
+    else:
+        cur.execute(f"""
+            SELECT trade_date, param_name, actual_drift, hard_min, hard_max
+            FROM {BOUNDARY_TABLE}
+            WHERE trade_date >= date(?, '-7 days') AND trade_date <= ?
+            ORDER BY trade_date DESC
+        """, (trade_date, trade_date))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return {"alert": False, "message": "无边界记录"}
+
+    # 统计连续逼近极值的参数
+    from collections import Counter
+    hit_names = Counter()
+    for r in rows:
+        tdate, pname, drift, hmin, hmax = r
+        if drift and drift not in ("—", "未核查"):
+            try:
+                dv = float(drift.replace("%", "").replace("+", ""))
+                hn = float(hmin.replace("%", "")) if hmin != "—" else None
+                hx = float(hmax.replace("%", "")) if hmax != "—" else None
+                if hn is not None and abs(dv - hn) / max(abs(hn), 1) < 0.1:
+                    hit_names[pname] += 1
+                if hx is not None and abs(dv - hx) / max(abs(hx), 1) < 0.1:
+                    hit_names[pname] += 1
+            except:
+                pass
+
+    alert_items = {k: v for k, v in hit_names.items() if v >= 3}
+    if alert_items:
+        msg = f"⚠️ 以下参数连续多处逼近边界极值: {', '.join(alert_items.keys())}，建议人工重新评估边界区间"
+        return {"alert": True, "items": alert_items, "message": msg}
+    return {"alert": False, "message": "无连续边界逼近风险"}
+
+
+def record_boundary_and_notify():
+    """
+    操作三完整交互流程：
+    步骤1→步骤2→步骤3→步骤4
+    """
+    print("\n" + "=" * 60)
+    print("  【操作三】人工限制参数进化边界（防过拟合）")
+    print("=" * 60)
+
+    # 步骤1：参数偏移报告
+    print("\n" + generate_boundary_drift_report(TRADE_DATE))
+    print("\n---")
+
+    # 步骤2: 选择类别
+    print("\n参数类别:")
+    cat_list = list(BOUNDARY_RULES.keys())
+    for i, cat in enumerate(cat_list, 1):
+        info = BOUNDARY_RULES[cat]
+        print(f"  {i}. {cat} — {info['module']} ({len(info['params'])}个参数)")
+
+    print("\n(输入 q 结束边界设置)")
+    while True:
+        choice = input("\n选择参数类别(编号/名称/q): ").strip()
+        if choice.lower() == 'q':
+            break
+        # 编号或名称匹配
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(cat_list):
+                cat = cat_list[idx]
+            else:
+                print("无效编号")
+                continue
+        else:
+            if choice in BOUNDARY_RULES:
+                cat = choice
+            else:
+                print(f"无效类别，可选: {', '.join(cat_list)}")
+                continue
+
+        cat_info = BOUNDARY_RULES[cat]
+        print(f"\n  [{cat}] — {cat_info['logic'][:60]}...")
+        params = list(cat_info["params"].items())
+
+        for i, (pname, pinfo) in enumerate(params, 1):
+            print(f"\n  --- 参数 {i}/{len(params)}: {pinfo['desc']} ---")
+            print(f"    基准值: {pinfo['baseline']} | 硬性下限: {pinfo['hard_min']} | 硬性上限: {pinfo['hard_max']}")
+            drift = input(f"    当日实际值(留空=未核查): ").strip()
+            new_min = input(f"    人工设定最小值/下限({pinfo['hard_min']}): ").strip() or pinfo["hard_min"]
+            new_max = input(f"    人工设定最大值/上限({pinfo['hard_max']}): ").strip() or pinfo["hard_max"]
+            print("    生效周期: 1=当日临时生效  2=长期永久边界")
+            period_choice = input(f"    请选择(1/2, 默认2): ").strip()
+            validity = "当日临时生效" if period_choice == "1" else "长期永久"
+
+            # 过拟合风险判定
+            risk_level = "L1"
+            if drift:
+                try:
+                    dv = float(drift.replace("%", "").replace("+", ""))
+                    bn = float(pinfo["hard_min"].replace("%", "")) if pinfo["hard_min"] != "—" else None
+                    bx = float(pinfo["hard_max"].replace("%", "")) if pinfo["hard_max"] != "—" else None
+                    if bn is not None and dv < bn:
+                        risk_level = "L3"
+                    elif bx is not None and dv > bx:
+                        risk_level = "L3"
+                    elif bn is not None and abs(dv - bn) / max(abs(bn), 1) < 0.15:
+                        risk_level = "L2"
+                    elif bx is not None and abs(dv - bx) / max(abs(bx), 1) < 0.15:
+                        risk_level = "L2"
+                except:
+                    pass
+
+            notes_input = input(f"    备注(可选): ").strip()
+
+            save_evolution_boundary(
+                TRADE_DATE, cat, pname, pinfo["desc"],
+                pinfo["baseline"], new_min, new_max, drift,
+                validity, risk_level, notes_input
+            )
+
+            sev_name = BOUNDARY_SEVERITY.get(risk_level, {}).get("name", risk_level)
+            print(f"  ✅ [{risk_level} {sev_name}] {pinfo['desc']}: [{new_min}~{new_max}] 已保存")
+
+        # 类别级别风险标记
+        cat_risk = input(f"\n  此类别整体过拟合风险等级(L1/L2/L3, 默认按参数自动): ").strip().upper()
+        if cat_risk in ("L1", "L2", "L3"):
+            record_overfitting_risk(TRADE_DATE, cat, cat_risk,
+                                    f"人工评估类别整体风险: {BOUNDARY_SEVERITY.get(cat_risk,{}).get('name','')}")
+            print(f"  ✅ 类别风险已标记: [{cat_risk}]")
+
+        more = input(f"\n是否继续设置其他类别？(y/n): ").strip().lower()
+        if more != 'y':
+            break
+
+    # 步骤3：写入参数锁
+    print("\n" + "-" * 40)
+    print("  步骤3: 写入参数锁...")
+    lock_path, lock_count = apply_boundary_locks(TRADE_DATE)
+    print(f"  ✅ 参数锁已写入: {lock_path} ({lock_count}项)")
+
+    # 连续3日边界逼近检查
+    alert_result = check_boundary_hit_days(TRADE_DATE)
+    if alert_result["alert"]:
+        print(f"\n  {alert_result['message']}")
+
+    # 步骤4：归档完毕
+    print(f"\n{'='*60}")
+    print(f"  【操作三】完成")
+    print(f"{'='*60}")
+
+
+def generate_boundary_log(trade_date: str) -> str:
+    """生成操作三复盘日志"""
+    conn = sqlite3.connect(str(MODULE06_DB))
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT param_category, param_name, param_desc, baseline_value,
+               hard_min, hard_max, actual_drift, validity, risk_level, notes
+        FROM {BOUNDARY_TABLE}
+        WHERE trade_date = ?
+        ORDER BY param_category, param_name
+    """, (trade_date,))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        return ""
+
+    lines = [
+        "",
+        "### 操作三：参数进化边界设置（防过拟合）",
+        "",
+        "| 类别 | 参数 | 基准值 | 边界[下限~上限] | 当日实际 | 生效周期 | 风险等级 |",
+        "|:----:|:----:|:------:|:----------------:|:--------:|:--------:|:--------:|",
+    ]
+
+    cat_counts = {}
+    for r in rows:
+        cat, pname, desc, bl, hmin, hmax, drift, val, rl, notes_r = r
+        range_str = f"[{hmin}~{hmax}]"
+        rl_name = BOUNDARY_SEVERITY.get(rl, {}).get("name", rl)
+        lines.append(f"| {cat} | {desc} | {bl} | {range_str} | {drift or '—'} | {val} | [{rl}]{rl_name} |")
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+
+    lines += ["", "**分类统计:**"]
+    for c, n in cat_counts.items():
+        lines.append(f"- {c}: {n}个参数")
+
+    # 边界锁文件路径
+    lock_path = BASE / f"config/param_boundary_locks_{trade_date}.json"
+    if lock_path.exists():
+        lines.append(f"")
+        lines.append(f"📄 **边界锁文件**: {lock_path}")
+
+    # 连续逼近检查
+    alert = check_boundary_hit_days(trade_date)
+    if alert["alert"]:
+        lines.append(f"")
+        lines.append(f"⚠️ **{alert['message']}**")
+
+    return "\n".join(lines)
+
+
+def load_boundary_locks(trade_date: str = None) -> dict:
+    """
+    次日盘前加载边界锁
+    系统初始化时调用，返回边界锁字典；L3锁定的参数返回"locked"标记
+    """
+    if trade_date is None:
+        trade_date = TODAY
+
+    lock_path = BASE / f"config/param_boundary_locks_{trade_date}.json"
+    if lock_path.exists():
+        with open(lock_path) as f:
+            return json.load(f)
+
+    # 降级：使用默认边界规则
+    log.info("无当日边界锁文件，使用BOUNDARY_RULES默认边界")
+    rules = {}
+    for cat, info in BOUNDARY_RULES.items():
+        for pname, pinfo in info["params"].items():
+            rules[f"{cat}.{pname}"] = {
+                "desc": pinfo["desc"],
+                "hard_min": pinfo["hard_min"],
+                "hard_max": pinfo["hard_max"],
+                "source": "BOUNDARY_RULES默认(无手动锁)"
+            }
+    return {"trade_date": trade_date, "locks": rules, "description": "默认边界(降级)"}
+
+
+# ═══════════════════════════════════════════
+#  工具函数
+# ═══════════════════════════════════════════
+
+
 def generate_calibration_log(trade_date: str):
     """生成当日复盘校准日志"""
     conn = sqlite3.connect(str(MODULE06_DB))
@@ -516,25 +1154,38 @@ def generate_calibration_log(trade_date: str):
     if vuln_log:
         lines.append(vuln_log)
 
-    # 完整盘后清单
+    # 追加参数进化边界日志（操作三）
+    boundary_log = generate_boundary_log(trade_date)
+    if boundary_log:
+        lines.append(boundary_log)
+
+    # 完整盘后清单 — 三大核心操作15项
     lines += [
         "",
         "---",
-        "### 完整盘后操作清单",
+        "### 完整盘后操作清单（三大核心操作）",
         "",
         "| # | 操作项 | 录入内容 | 完成✅ |",
         "|:-:|:-------|:---------|:----:|",
+        "| **操作一：真实交易结果校准** | | |",
         "| 1 | 全标的行情录入 | 每只真实涨跌、支撑压力突破结果 | ✅ |",
         "| 2 | 真实操作记录 | 持仓/止盈/止损/空仓全部操作 | ✅ |",
         "| 3 | 标签① | AI预判涨实际大跌→[L01]预判高估，负误差 | □ |",
         "| 4 | 标签② | AI预判跌实际大涨→[L02]预判低估，负误差 | □ |",
         "| 5 | 标签③ | 风控提示减仓后持续大跌→[L03]风控判断有效 | □ |",
         "| 6 | 标签④ | 满足入场开仓后被套→[L04]入场条件失效 | □ |",
+        "| **操作二：人工修正研判漏洞** | | |",
         "| 7 | 研判漏洞完整记录 | 填写标的/研判/事实/漏洞分类 | □ |",
         "| 8 | 人工补丁录入 | 补充特征词/调整参数/新增风控条件 | □ |",
         "| 9 | 漏洞等级标记 | L1轻度/L2中度/L3重度 | □ |",
-        "| 10 | 样本库同步归档 | 漏洞与误差标签合并入库 | ✅ |",
-        "| 11 | 自动迭代触发 | 样本回传Layer1/交易模块/Layer2 | ✅ |",
+        "| **操作三：参数进化边界设置** | | |",
+        "| 10 | 参数偏移核查 | 对比基准参数，记录当日迭代后参数浮动幅度 | □ |",
+        "| 11 | 进化边界填写 | 填写参数类别/基准值/下限/上限/生效周期 | □ |",
+        "| 12 | 写入参数锁 | 系统加载边界硬约束，截断超边界极端参数 | □ |",
+        "| 13 | 过拟合风险分级 | L1低风险/L2中风险/L3高风险 | □ |",
+        "| **全局归档** | | |",
+        "| 14 | 样本库同步归档 | 误差/漏洞/边界数据合并入库 | ✅ |",
+        "| 15 | 自动迭代触发 | 样本回传Layer1/交易模块/Layer2 | ✅ |",
     ]
 
     return "\n".join(lines)
@@ -565,6 +1216,7 @@ def main():
     parser = argparse.ArgumentParser(description="Module_06 盘后样本校准与智能体自修正")
     parser.add_argument("--auto", action="store_true", help="自动模式(基于预判vs真实行情自动打标)")
     parser.add_argument("--vuln", action="store_true", help="执行研判漏洞修正操作")
+    parser.add_argument("--boundary", action="store_true", help="执行参数进化边界设置")
     parser.add_argument("--check-only", action="store_true", help="仅检查今日是否已完成校准")
     args = parser.parse_args()
 
@@ -578,7 +1230,7 @@ def main():
         return
 
     # 仅漏洞修正模式
-    if args.vuln and not args.auto:
+    if args.vuln and not args.auto and not args.boundary:
         init_db()
         print(f"{'='*60}")
         print(f"  Module_06 【操作二】人工研判漏洞修正")
@@ -587,6 +1239,19 @@ def main():
         record_vuln_and_notify()
         print(f"\n{'='*60}")
         print(f"  【操作二】完成")
+        print(f"{'='*60}")
+        return
+
+    # 仅边界设置模式
+    if args.boundary and not args.auto and not args.vuln:
+        init_db()
+        print(f"{'='*60}")
+        print(f"  Module_06 【操作三】参数进化边界设置（防过拟合）")
+        print(f"  交易日: {TRADE_DATE}")
+        print(f"{'='*60}")
+        record_boundary_and_notify()
+        print(f"\n{'='*60}")
+        print(f"  【操作三】完成")
         print(f"{'='*60}")
         return
 
@@ -684,6 +1349,13 @@ def main():
         print("  【操作二】人工研判漏洞修正")
         print("=" * 60)
         record_vuln_and_notify()
+
+    # 8. 如果同时指定 --boundary，执行操作三
+    if args.boundary:
+        print("\n" + "=" * 60)
+        print("  【操作三】参数进化边界设置（防过拟合）")
+        print("=" * 60)
+        record_boundary_and_notify()
 
     print(f"\n{'='*60}")
     print(f"  Module_06 完成")
