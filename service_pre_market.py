@@ -14,6 +14,8 @@ PRD §新增: 每个交易日开盘前5分钟自动执行前置初始化：
 
 import logging
 import json
+import os
+import fcntl
 import sqlite3
 import time
 from pathlib import Path
@@ -28,6 +30,52 @@ logging.basicConfig(
 
 BASE = Path("/opt/stock_agent")
 MEMORY_DB = BASE / "agent_memory.db"
+
+# ═══════════════════════════════════════
+#  全局文件锁（防双定时冲突）
+# ═══════════════════════════════════════
+# 两个定时任务同时触发时，抢占锁的进程执行，另一个直接退出
+LOCK_PATH = Path("/opt/data/lock")
+LOCK_FILE = LOCK_PATH / "pre_market.lock"
+
+_LOCK_FD = None  # 全局锁文件描述符
+
+def acquire_lock() -> bool:
+    """获取独占文件锁；成功返回True，已有锁返回False（不阻塞）"""
+    global _LOCK_FD
+    try:
+        LOCK_PATH.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _LOCK_FD = fd
+            return True
+        except BlockingIOError:
+            os.close(fd)
+            return False
+    except Exception as e:
+        # 锁机制异常时退化为允许执行（不阻塞业务）
+        logging.warning(f"文件锁异常(退化为放行): {e}")
+        return True
+
+def release_lock():
+    """释放文件锁（主动调用 + 进程退出时内核自动释放）"""
+    global _LOCK_FD
+    if _LOCK_FD is not None:
+        try:
+            fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
+            os.close(_LOCK_FD)
+        except Exception:
+            pass
+        finally:
+            _LOCK_FD = None
+
+    # 清理空锁目录（可选，不影响功能）
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
 
 # =====================
 # Step1: 基线快照加载+校验
@@ -717,8 +765,16 @@ def pre_market_cron_job() -> str:
 
 
 if __name__ == "__main__":
-    report = run_pre_market_pipeline()
-    print()
-    print(f"✅ 开盘前预处理: {report['overall_status']}")
-    print(f"   步骤: {report['steps_ok']}/{report['total_steps']}")
-    print(f"   告警: {report.get('alert_count', 0)}条")
+    # 全局文件锁：双定时同时触发时只执行一次
+    if not acquire_lock():
+        logging.info("另一进程已持有锁，直接退出（双定时防重复）")
+        sys.exit(0)
+
+    try:
+        report = run_pre_market_pipeline()
+        print()
+        print(f"✅ 开盘前预处理: {report['overall_status']}")
+        print(f"   步骤: {report['steps_ok']}/{report['total_steps']}")
+        print(f"   告警: {report.get('alert_count', 0)}条")
+    finally:
+        release_lock()
