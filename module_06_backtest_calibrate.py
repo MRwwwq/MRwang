@@ -527,8 +527,17 @@ def sync_vuln_to_modules(trade_date, vuln_category, severity, fix_patch):
         log.info(f"  → Layer2 风控条件补丁: {act}")
 
 
-def record_vuln_and_notify():
-    """交互式记录研判漏洞（人工录入）"""
+def record_vuln_and_notify(auto_mode=False):
+    """交互式记录研判漏洞（人工录入）
+    
+    Args:
+        auto_mode: True时跳过交互，仅在cron/自动化场景报告无漏洞记录
+    """
+    if auto_mode:
+        print("  ℹ️ 自动模式: 跳过人工漏洞修正（需人工补充隐性信息盲区）")
+        print("  ℹ️ 可在收盘后手动执行: python3 module_06_backtest_calibrate.py --vuln")
+        return
+
     print("\n" + "=" * 60)
     print("  【操作二】人工研判漏洞修正")
     print("=" * 60)
@@ -765,7 +774,7 @@ def apply_boundary_locks(trade_date: str):
                     "unit": pinfo["unit"],
                     "source": "BOUNDARY_RULES默认"
                 }
-        lock_path = BASE / f"config/param_boundary_locks_{TRADE_DATE}.json"
+        lock_path = BASE / f"config/param_boundary_locks_{trade_date}.json"
         os.makedirs(str(lock_path.parent), exist_ok=True)
         with open(lock_path, "w") as f:
             json.dump({
@@ -789,7 +798,7 @@ def apply_boundary_locks(trade_date: str):
             "source": f"人工设置({trade_date})"
         }
 
-    lock_path = BASE / f"config/param_boundary_locks_{TRADE_DATE}.json"
+    lock_path = BASE / f"config/param_boundary_locks_{trade_date}.json"
     os.makedirs(str(lock_path.parent), exist_ok=True)
     with open(lock_path, "w") as f:
         json.dump({
@@ -903,10 +912,13 @@ def check_boundary_hit_days(trade_date: str, param_category: str = None) -> dict
     return {"alert": False, "message": "无连续边界逼近风险"}
 
 
-def record_boundary_and_notify():
+def record_boundary_and_notify(auto_mode=False):
     """
-    操作三完整交互流程：
+    操作三完整流程：
     步骤1→步骤2→步骤3→步骤4
+    
+    Args:
+        auto_mode: True时使用默认边界写入锁并退出，跳过交互式设置
     """
     print("\n" + "=" * 60)
     print("  【操作三】人工限制参数进化边界（防过拟合）")
@@ -914,7 +926,16 @@ def record_boundary_and_notify():
 
     # 步骤1：参数偏移报告
     print("\n" + generate_boundary_drift_report(TRADE_DATE))
-    print("\n---")
+
+    if auto_mode:
+        print("\n  ℹ️ 自动模式: 使用BOUNDARY_RULES默认边界写入锁")
+        # 步骤3：直接使用默认边界写入锁
+        lock_path, lock_count = apply_boundary_locks(TRADE_DATE)
+        print(f"  ✅ 参数锁已写入: {lock_path} ({lock_count}项)")
+        print(f"\n{'='*60}")
+        print(f"  【操作三】完成（自动模式）")
+        print(f"{'='*60}")
+        return
 
     # 步骤2: 选择类别
     print("\n参数类别:")
@@ -1348,14 +1369,14 @@ def main():
         print("\n" + "=" * 60)
         print("  【操作二】人工研判漏洞修正")
         print("=" * 60)
-        record_vuln_and_notify()
+        record_vuln_and_notify(auto_mode=args.auto)
 
     # 8. 如果同时指定 --boundary，执行操作三
     if args.boundary:
         print("\n" + "=" * 60)
         print("  【操作三】参数进化边界设置（防过拟合）")
         print("=" * 60)
-        record_boundary_and_notify()
+        record_boundary_and_notify(auto_mode=args.auto)
 
     print(f"\n{'='*60}")
     print(f"  Module_06 完成")
