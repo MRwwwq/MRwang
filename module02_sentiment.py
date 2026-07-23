@@ -71,6 +71,70 @@ def apply_psy_codes(sentiment_label: str, has_massacre: bool, is_boom: bool):
         logging.info(f"  🧠 高潮无亏钱→新增 code_13")
 
 
+# ====================== 市场趋势判定（520联动） ======================
+
+def judge_market_trend(up_count: int, down_count: int,
+                       has_massacre: bool) -> tuple:
+    """判定市场环境标签。"""
+    total = up_count + down_count
+    up_ratio = up_count / total * 100 if total > 0 else 50
+    if up_ratio >= 60 and not has_massacre:
+        return ("多头趋势", 1.0, f"上涨{up_count}家({up_ratio:.0f}%)≥60% 无亏钱效应")
+    elif has_massacre or up_ratio < 40:
+        return ("亏钱效应", 0.4, f"上涨{up_count}家({up_ratio:.0f}%) 或亏钱效应")
+    else:
+        return ("震荡行情", 0.4, f"涨跌均衡 上涨{up_count}家({up_ratio:.0f}%)")
+
+
+def is_bear_market_override(
+    up_count: int, down_count: int,
+    highest_board: int, has_massacre: bool,
+) -> tuple:
+    """判定是否熊市单边下行环境（覆盖520权重=0.0）。
+
+    触发条件（任一）:
+      1. 下跌家数≥3500 且 连板高度≤2
+      2. 上涨占比<25% 且 连板高度≤2 且 有核按钮
+    返回: (override: bool, reason: str)
+    """
+    total = up_count + down_count
+    up_ratio = up_count / total * 100 if total > 0 else 50
+    if down_count >= 3500 and highest_board <= 2:
+        return True, f"熊市单边下行: 下跌{down_count}≥3500 连板≤{highest_board}"
+    if up_ratio < 25 and highest_board <= 2 and has_massacre:
+        return True, f"熊市单边下行: 上涨占比{up_ratio:.0f}%<25% 连板≤{highest_board} 亏钱效应"
+    return False, ""
+
+
+def get_520_override_weight(
+    sentiment_label: str,
+    up_count: int, down_count: int,
+    highest_board: int, blow_rate: float,
+    has_massacre: bool,
+) -> tuple:
+    """获取520最终权重(含个股数据+情绪降级+熊市覆盖)。
+
+    返回: (weight: float, reason: str)
+    """
+    from module01_config_520 import get_520_weight, get_520_weight_desc
+
+    # 第1重: 熊市单边下行 → 直接屏蔽
+    bear_override, bear_reason = is_bear_market_override(
+        up_count, down_count, highest_board, has_massacre
+    )
+    if bear_override:
+        return (0.0, f"熊市屏蔽: {bear_reason}")
+
+    # 第2重: 高亏钱效应(炸板率≥35 + 连板<3) → 降级60%
+    if blow_rate >= 35 and highest_board <= 2:
+        return (0.4, f"亏钱效应降级: 炸板{blow_rate}%≥35% 连板≤{highest_board} → 520权重降至0.4, 仅观察")
+
+    # 第3重: 情绪阶段映射
+    base_weight = get_520_weight(sentiment_label)
+    desc = get_520_weight_desc(sentiment_label)
+    return (base_weight, desc)
+
+
 # ====================== 主入口 ======================
 
 def run_module02(
@@ -126,6 +190,16 @@ def run_module02(
     final_total_cap = min(module01_total_cap, sentiment_cap)
     logging.info(f"  → 风格仓位{module01_total_cap}% vs 情绪仓位{sentiment_cap}%")
     logging.info(f"  → 最终总仓上限: {final_total_cap}% (取较小值)")
+
+    # 5. 520信号权重判定（三重覆盖: 熊市屏蔽→亏钱效应降级→情绪阶段映射）
+    from module01_config_520 import SENTIMENT_TO_520_WEIGHT
+    signal_520_weight, weight_reason = get_520_override_weight(
+        sentiment_label=label,
+        up_count=up_count, down_count=down_count,
+        highest_board=highest_board, blow_rate=blow_rate,
+        has_massacre=has_massacre,
+    )
+    logging.info(f"  → 520权重: {signal_520_weight} ({weight_reason})")
     logging.info(f"  → psy_hit_codes 当前: {psy_hit_codes}")
     logging.info("Module02 定情绪 完成")
     logging.info("=" * 50)
@@ -140,6 +214,10 @@ def run_module02(
         "has_massacre": has_massacre,
         "judge_reason": reason,
         "massacre_note": massacre_note,
+        "market_trend_label": weight_reason.split(":")[0].strip(),
+        "signal_520_weight": signal_520_weight,
+        "signal_520_weight_desc": weight_reason,
+        "bear_market_override": signal_520_weight == 0.0,
     }
 
 

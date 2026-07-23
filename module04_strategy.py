@@ -102,6 +102,128 @@ def calc_per_stock_cap(
     return final
 
 
+# ====================== 520信号二次复核 ======================
+
+def check_520_secondary_review(stock: dict, main_line: str = "",
+                                fund_catalyst: bool = True) -> dict:
+    """520二次复核: 主线题材+资金流+黑名单+芒格风控。
+
+    用于M03→M04过程中，所有520合格标的必须通过此复核。
+    520多头信号仅作为加分因子，无独立开仓权限。
+
+    stock字段: {code, name, signal_520_passed, is_blacklisted, ...,
+                dragon_return_520}
+
+    返回: {"allowed": bool, "reason": str, "weight": float}
+    """
+    code = stock.get("code", "")
+    name = stock.get("name", "")
+
+    # 黑名单一票否决
+    if stock.get("is_blacklisted", False):
+        return {"allowed": False, "reason": f"黑名单拦截 {code}({name})", "weight": 0}
+
+    # 520信号基础校验
+    signal_520_passed = stock.get("signal_520_passed", False)
+    if not signal_520_passed:
+        return {"allowed": False, "reason": f"{code} 520信号不满足", "weight": 0}
+
+    # 主线题材复核（空=无主线，不硬拦但降权）
+    if not main_line or main_line.strip() == "":
+        return {"allowed": True, "reason": f"{code} 无主线, 520降级观察",
+                "weight": 0.6}
+
+    # 资金流向复核
+    if not fund_catalyst:
+        return {"allowed": False, "reason": f"{code} 资金面偏空", "weight": 0}
+
+    return {"allowed": True, "reason": f"{code} 520二次复核通过 ✅", "weight": 1.0}
+
+
+# ====================== 520信号开仓校验（D模式+芒格风控联动） ======================
+
+def check_520_open_signal(stock: dict,
+                          signal_520_weight: float = 1.0,
+                          sentiment_label: str = "recovery",
+                          psy_hit_codes_global: list = None) -> dict:
+    """校验520信号+资金催化+黑名单+芒格误判风控，判定是否可生成开仓信号。
+
+    stock字段:
+        {code, name, role, signal_520_passed (bool), signal_520_blocked_by (str),
+         fund_catalyst (bool, 可选), is_blacklisted (bool),
+         dragon_return_520 (dict, 可选)}
+
+    psy_hit_codes_global: 全局psy_hit_codes列表, 用于三重共振拦截
+
+    返回: {"allowed": bool, "reason": str, "weight": float,
+           "lolla_blocked": bool, "lolla_details": dict}
+    """
+    code = stock.get("code", "")
+    name = stock.get("name", "")
+    lolla_details = {}
+
+    # ───── 第1关: 黑名单一票否决 ─────
+    if stock.get("is_blacklisted", False):
+        return {"allowed": False, "reason": f"黑名单拦截 {code}({name})",
+                "weight": 0, "lolla_blocked": False, "lolla_details": {}}
+
+    # ───── 第2关: 520信号校验 ─────
+    signal_520_passed = stock.get("signal_520_passed", False)
+    signal_520_blocked_by = stock.get("signal_520_blocked_by", "")
+    if not signal_520_passed:
+        return {"allowed": False, "reason": f"{code} 520信号未通过: {signal_520_blocked_by[:60]}",
+                "weight": 0, "lolla_blocked": False, "lolla_details": {}}
+
+    # ───── 第3关: 资金催化 ─────
+    fund = stock.get("fund_catalyst", True)
+    if not fund:
+        return {"allowed": False, "reason": f"{code} 资金面偏空",
+                "weight": 0, "lolla_blocked": False, "lolla_details": {}}
+
+    # ───── 第4关: 芒格误判风控（读取全局psy_hit_codes） ─────
+    LOLLA_TRIPLE = {
+        "code_04_避免怀疑": "避免怀疑",
+        "code_14_损失厌恶": "损失厌恶",
+        "code_08_嫉妒猜忌": "嫉妒猜忌",
+    }
+    codes_source = psy_hit_codes_global or []
+    active_lolla = {k: v for k, v in LOLLA_TRIPLE.items() if k in codes_source}
+
+    lolla_details = {
+        "active_codes": list(active_lolla.keys()),
+        "active_names": list(active_lolla.values()),
+        "count": len(active_lolla),
+        "total_psy_hit": len(codes_source),
+    }
+    lolla_blocked = len(active_lolla) >= 2 or len(codes_source) >= 3
+    if lolla_blocked:
+        return {
+            "allowed": False,
+            "reason": (
+                f"🚫 Lollapalooza风控拦截 {code}: "
+                f"{len(active_lolla)}项三重共振({','.join(active_lolla.values())}), "
+                f"psy高分{len(codes_source)}项"
+            ),
+            "weight": 0,
+            "lolla_blocked": True,
+            "lolla_details": lolla_details,
+        }
+
+    # ───── 第5关: 520权重联动 ─────
+    # signal_520_weight==0.0 → 不生成开仓
+    if signal_520_weight == 0.0:
+        return {"allowed": False, "reason": f"{code} 520权重=0.0, 情绪屏蔽不开仓",
+                "weight": 0, "lolla_blocked": False, "lolla_details": lolla_details}
+
+    return {
+        "allowed": True,
+        "reason": f"{code} 520通过+资金催化 OK (M02权重×{signal_520_weight})",
+        "weight": signal_520_weight,
+        "lolla_blocked": False,
+        "lolla_details": lolla_details,
+    }
+
+
 # ====================== 主入口 ======================
 
 def run_module04(
@@ -112,6 +234,8 @@ def run_module04(
     stop_loss_pct: float,     # Module01 style里定义的
     sentiment_label: str,     # Module02 情绪标签
     selected_filtered: dict,  # Module03 输出的 {core, fill, latent}
+    main_line: str = "",      # M03主线, 用于520二次复核
+    signal_520_weight: float = 1.0,  # M02 520权重 (0.0/0.4/1.0)
 ) -> dict:
     """
     Module04 定策略主入口。
@@ -181,17 +305,68 @@ def run_module04(
     stock_count = len(tradeable)
     per_stock_cap = calc_per_stock_cap(total_cap, per_stock_max, stock_count, sentiment_label)
 
-    # 6. 生成最终交易池 (含分配仓位)
+    # 6. 生成最终交易池 (含520二次复核 + 芒格风控 + 仓位分配)
     tradeable_pool = []
+    lolla_blocked_count = 0
+    blacklist_blocked_count = len(blacklist_blocked)
+    signal_520_fail_count = 0
+
     for s in tradeable:
+        s["is_blacklisted"] = False  # 已过黑名单
+
+        # 6a. 全部标的执行520二次复核 + 芒格风控联检
+        sec_review = check_520_secondary_review(s, main_line=main_line,
+                                                 fund_catalyst=True)
+        if not sec_review["allowed"]:
+            logging.info(f"  ⏭️ 二次复核过滤 {s.get('code','')}: {sec_review['reason']}")
+            signal_520_fail_count += 1
+            continue
+
+        # 6b. 芒格风控: 三重共振拦截（loss aversion + avoid doubt + jealousy）
+        lolla_check = check_520_open_signal(
+            s, signal_520_weight=signal_520_weight,
+            sentiment_label=sentiment_label,
+            psy_hit_codes_global=psy_hit_codes if hasattr(psy_hit_codes, '__iter__') else [],
+        )
+        if lolla_check["lolla_blocked"]:
+            logging.warning(f"  🚫 芒格拦截 {s.get('code','')}: {lolla_check['reason']}")
+            lolla_blocked_count += 1
+            continue
+
+        # 6c. 仓位分配
+        if active_style == "D":
+            # D模式: 极小仓潜伏, 强制校验520信号
+            alloc_pct = min(per_stock_cap, 3)  # D模式单票≤3%
+        else:
+            alloc_pct = per_stock_cap
+
+        # 龙回头标记
+        dragon = s.get("dragon_return_520", {}).get("signal", False)
+        role_name_suffix = " (龙回头)" if dragon else ""
+
         tradeable_pool.append({
             "code": s.get("code", ""),
             "name": s.get("name", ""),
-            "role": s.get("role_name", ""),
-            "alloc_pct": per_stock_cap,       # 单票分配仓位
-            "stop_loss": stop_loss_pct,        # 统一切损
+            "role": s.get("role_name", "") + role_name_suffix,
+            "alloc_pct": alloc_pct,
+            "stop_loss": stop_loss_pct,
             "reason": s.get("reason", ""),
+            "signal_520_passed": s.get("signal_520_passed", False),
+            "dragon_return": dragon,
         })
+
+    # 统计520信号: 全部候选标的的520通过率
+    total_candidates = len(all_candidates)
+    blacklisted = len(blacklist_blocked) + len(failure_blocked_codes)
+    signal_520_not_pass = signal_520_fail_count
+    mood_520_blocked = lolla_blocked_count  # 芒格拦截
+
+    logging.info(f"  📊 520四重锁统计:")
+    logging.info(f"     原始候选: {total_candidates}只")
+    logging.info(f"     黑名单拦截: {blacklisted}只")
+    logging.info(f"     520信号+复核拦截: {signal_520_not_pass}只")
+    logging.info(f"     芒格风控拦截: {mood_520_blocked}只")
+    logging.info(f"     最终可交易: {len(tradeable_pool)}只")
 
     # 7. 输出
     logging.info(f"  单票仓位: {per_stock_cap}% (总仓{total_cap}%/{stock_count}只)")
@@ -213,6 +388,10 @@ def run_module04(
         "failure_blocked": failure_blocked_codes,
         "tradeable_pool": tradeable_pool,
         "pool_sent_to_layer1": True,
+        "signal_520_weight": signal_520_weight,
+        "signal_520_secondary_review_count": signal_520_fail_count,
+        "lolla_blocked_count": lolla_blocked_count,
+        "dragon_return_count": sum(1 for s in tradeable_pool if s.get("dragon_return")),
     }
 
 

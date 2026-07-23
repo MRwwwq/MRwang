@@ -25,6 +25,7 @@ import os
 import numpy as np
 from typing import Optional
 from psy_hit_manager import get_psy_hit_count, psy_hit_codes
+from rule021_dual_branch import Rule021DualBranchChecker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [L1] %(message)s", datefmt="%H:%M:%S")
 
@@ -557,8 +558,10 @@ class Layer1FeatureEngine:
         self.keyword_extractor = KeywordExtractor()
         self.rule_021 = Rule021Checker()
         self.linkage = ThreeLayerLinkageCheck()
+        self.dual_branch_checker = Rule021DualBranchChecker()
 
-    def run(self, signal_output: dict) -> dict:
+    def run(self, signal_output: dict,
+            stock_context: dict = None) -> dict:
         """
         全流水线执行。
 
@@ -625,6 +628,20 @@ class Layer1FeatureEngine:
             arrow = "🟢" if dim["direction"] == "bullish" else ("🔴" if dim["direction"] == "bearish" else "🟡")
             logging.info(f"    {arrow} {dim['name']:6s}: score={dim['score']:<5.1f} {dim['direction']:10s} ({dim['signal_count']}信号)")
 
+        # Step 5b: Rule021 双分支差异化打分 (v2.2)
+        if stock_context:
+            dual_branch_result = self.dual_branch_checker.check(
+                stock_code=stock_context.get("stock_code", ""),
+                stock_name=stock_context.get("stock_name", ""),
+                sector=stock_context.get("sector", ""),
+                business_desc=stock_context.get("business_desc", ""),
+                signal_output=signal_output,
+                stock_data=stock_context.get("stock_data"),
+            )
+            logging.info(dual_branch_result["score_table"])
+        else:
+            dual_branch_result = None
+
         # Step 6: 三层联动校验
         logging.info("  [Step 6/6] 三层联动架构校验 (技术+基本面+情绪)")
         linkage_result = self.linkage.check(signal_output)
@@ -647,6 +664,7 @@ class Layer1FeatureEngine:
             "psy_category_detail": psy_category_count,
             "lolla_direct_red": lolla_direct_red,
             "rule_021": rule_021_result,
+            "rule_021_dual_branch": dual_branch_result,  # v2.2 新增
             "three_layer_linkage": linkage_result,
             "composite_signal": self._determine_composite_signal(
                 composite_score, rule_021_result, linkage_result, lolla_direct_red, total_psy_codes
@@ -685,21 +703,44 @@ class Layer1FeatureEngine:
     def _print_summary(self, result: dict) -> None:
         """打印执行汇总"""
         cr = result["composite_signal"]
+        dual = result.get("rule_021_dual_branch")
         logging.info("-" * 40)
         logging.info(f"  Layer1 汇总:")
         logging.info(f"    综合得分: {result['composite_score']:.4f}")
         logging.info(f"    特征激活: {result['active_features']}")
         logging.info(f"    心理误判: {result['psy_count']}条 (特征绑定{result['psy_category_matched']}类)")
+        if dual:
+            branch_icon = "🪙" if dual["branch"] == "resource" else "💡"
+            branch_label = "周期资源" if dual["branch"] == "resource" else "题材叙事"
+            logging.info(f"    {branch_icon} Rule021双分支: {dual['branch_label']} | "
+                         f"风险分{dual['final_risk_score']:.1f} | "
+                         f"{'⚠️高危' if dual['is_high_risk'] else '🟢正常'}")
         logging.info(f"    综合信号: {cr['direction']} | {cr['level']} | {cr['reason']}")
         logging.info("-" * 40)
 
 
 # ====================== 快捷入口 ======================
 
-def run_layer1(signal_output: dict) -> dict:
-    """Layer1 快捷执行入口"""
+def run_layer1(signal_output: dict,
+               stock_context: dict = None) -> dict:
+    """
+    Layer1 快捷执行入口 (v2.2 支持Rule021双分支)。
+
+    参数:
+        signal_output: Layer0 输出的五类信号字典
+        stock_context: 标的上文数据 {
+            "stock_code": "600547.SH",
+            "stock_name": "山东黄金",
+            "sector": "贵金属",
+            "business_desc": "黄金采选",
+            "stock_data": { commodity_price_percentile, ... }
+        }
+
+    返回:
+        Layer1 全部校验结果 + Rule021双分支结果
+    """
     engine = Layer1FeatureEngine()
-    return engine.run(signal_output)
+    return engine.run(signal_output, stock_context)
 
 
 # ====================== 测试 ======================

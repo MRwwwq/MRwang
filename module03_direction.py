@@ -129,6 +129,134 @@ def apply_psy_for_direction(
     return added
 
 
+# ====================== 520信号筛选（M03核心执行层） ======================
+
+def _check_stock_basics(stock: dict) -> tuple:
+    """基础面检查: ST/流动性/换手率。返回 (passed, reason)"""
+    name = stock.get("name", "")
+    if "ST" in name.upper() or "退" in name:
+        return False, f"ST/退市股: {name} ❌"
+
+    turnover = stock.get("turnover_rate", 0)
+    if turnover > 25:
+        return False, f"换手率{turnover:.1f}%>25%, 高位妖股 ❌"
+
+    vol_ratio = stock.get("volume_ratio", 1.0) or 1.0
+    # 流动性检查: 日均成交额≥5000万
+    avg_amount = stock.get("avg_daily_amount", 0) or 0
+    if avg_amount > 0 and avg_amount < 50_000_000:
+        return False, f"日均成交额{avg_amount/10000:.0f}万<5000万, 流动性不足 ❌"
+
+    return True, ""
+
+
+def filter_520_standard(stock: dict) -> tuple:
+    """520核心筛选（M03强制执行, 5条件全部满足）。
+
+    stock字段:
+        {ma5, ma20, close, volume, vol_ma5, ma20_trend, ma20_flat_or_up,
+         gold_cross, above_ma20, vol_ratio, turnover_rate, avg_daily_amount, name}
+    若无均线数据→跳过筛选不拦截。
+
+    返回: (passed: bool, reason: str)
+    """
+    ma5 = stock.get("ma5")
+    ma20 = stock.get("ma20")
+    close = stock.get("close")
+    volume = stock.get("volume")
+    vol_ma5 = stock.get("vol_ma5")
+    ma20_trend = stock.get("ma20_trend")
+    gold_cross = stock.get("gold_cross")
+    above_ma20 = stock.get("above_ma20")
+
+    if ma5 is None or ma20 is None or close is None:
+        return True, "无均线数据→跳过520筛选"
+
+    # ───── 硬性铁律: MA20下行 → 任何金叉直接作废 ─────
+    if ma20_trend is not None and not ma20_trend:
+        return False, f"MA20下行, 任何金叉直接作废 ❌"
+
+    # ───── 条件①: MA20走平或向上（斜率≥0）─────
+    ma20_flat_or_up = stock.get("ma20_flat_or_up")
+    if ma20_flat_or_up is not None and not ma20_flat_or_up:
+        return False, f"MA20斜率<0, 趋势向下 ❌"
+
+    # ───── 条件②: MA5有效上穿MA20（标准金叉）─────
+    if gold_cross is not None and not gold_cross:
+        if ma5 > ma20:
+            return False, f"MA5({ma5:.2f})>MA20({ma20:.2f})但非当日金叉(已在上方), 不满足上穿条件"
+        return False, f"MA5({ma5:.2f})≤MA20({ma20:.2f}), 非多头排列 ❌"
+
+    # ───── 条件③: 收盘站稳MA20上方 ─────
+    if above_ma20 is not None and not above_ma20:
+        return False, f"收盘{close:.2f}≤MA20({ma20:.2f}), 未站稳 ❌"
+    if close <= ma20:
+        return False, f"收盘{close:.2f}≤MA20({ma20:.2f}), 未站稳 ❌"
+
+    # ───── 条件④: 成交量放量确认 ─────
+    if volume is not None and vol_ma5 is not None and vol_ma5 > 0:
+        vol_ratio = volume / vol_ma5
+        if vol_ratio < 1.3:
+            return False, f"量比{vol_ratio:.2f}x<1.3x, 放量不足 ❌"
+
+    # ───── 条件⑤: 剔除ST/流动性不足/高位妖股 ─────
+    basic_pass, basic_reason = _check_stock_basics(stock)
+    if not basic_pass:
+        return False, basic_reason
+
+    return True, f"520全部条件通过 ✅ (金叉+MA20向上+站稳+放量+非妖股)"
+
+
+def check_dragon_return_520(stock: dict) -> dict:
+    """520龙回头低吸机会检测（M03额外形态识别）。
+
+    条件:
+      1. 多头格局: 近N日大多数时间在MA20上方
+      2. 回踩MA20不破: 近几日最低接近MA20(1.5%以内)但未实体跌破
+      3. 再度站上MA5: 当日收盘 > MA5
+
+    stock需含: close, ma5, ma20, above_ma20 (M00输出)
+    额外字段: recent_above_ma20_ratio (近10日站在MA20上方的比例, 可选)
+
+    返回: {"signal": bool, "type": str, "detail": str}
+    """
+    close = stock.get("close")
+    ma5 = stock.get("ma5")
+    ma20 = stock.get("ma20")
+    above_ma20 = stock.get("above_ma20")
+
+    if close is None or ma5 is None or ma20 is None:
+        return {"signal": False, "type": "无数据", "detail": "缺少均线数据"}
+
+    # 条件1: 多头格局 —— 收盘在MA20上方
+    if not above_ma20:
+        return {"signal": False, "type": "未触发",
+                "detail": f"收盘{close:.2f}<MA20({ma20:.2f}), 非多头格局 ❌"}
+
+    # 条件2: 回踩MA20不破 —— 收盘在MA20上方且离MA20较近(3%以内)
+    distance_to_ma20 = abs(close - ma20) / ma20 * 100
+    pullback_ok = distance_to_ma20 < 3.0
+
+    # 条件3: 再度站上MA5
+    reclaim_ma5 = close > ma5 if ma5 else False
+
+    dragon = pullback_ok and reclaim_ma5
+    return {
+        "signal": dragon,
+        "type": "520龙回头低吸" if dragon else "未触发",
+        "conditions": {
+            "above_ma20": bool(above_ma20),
+            "close_to_ma20_pct": round(distance_to_ma20, 2),
+            "reclaim_ma5": reclaim_ma5,
+        },
+        "detail": (
+            f"收盘{close:.2f}>MA20{ma20:.2f} ✅ | "
+            f"距MA20{distance_to_ma20:.1f}%{'✅' if pullback_ok else '❌'} | "
+            f"站回MA5{'✅' if reclaim_ma5 else '❌'}"
+        ),
+    }
+
+
 # ====================== 主入口 ======================
 
 def run_module03(
@@ -137,6 +265,7 @@ def run_module03(
     driver_detail: str,
     candidate_stocks: list,
     active_style: str,
+    signal_520_weight: float = 1.0,    # M02递送: 0.0=屏蔽, 0.4=降级, 1.0=正常
 ) -> dict:
     """
     Module03 定方向主入口。
@@ -188,7 +317,72 @@ def run_module03(
         else:
             kept.append(s)
 
-    # 3. 分层
+    # 3. 520信号基础筛选（加入每只候选的通过状态 + 龙回头）
+    signal_520_results = {}
+    signal_520_count = {"passed": 0, "failed_ma20_down": 0, "failed_gold_cross": 0,
+                        "failed_volume": 0, "failed_basics": 0, "dragon_return": 0}
+    MA20_DOWN_KEYWORDS = ["MA20下行", "作废"]
+    GOLD_CROSS_KEYWORDS = ["非多头排列", "上穿条件"]
+    VOLUME_KEYWORDS = ["放量不足"]
+    BASICS_KEYWORDS = ["ST/退市", "换手率", "流动性不足"]
+
+    for s in kept:
+        code = s.get("code", "")
+
+        # 520权重=0.0 → 强制屏蔽所有520金叉信号
+        if signal_520_weight == 0.0:
+            s["signal_520_passed"] = False
+            s["signal_520_blocked_by"] = "weight_0"
+            signal_520_results[code] = {"passed": False, "reason": "520权重=0.0, 情绪屏蔽 ❌"}
+            logging.info(f"  🚫 520屏蔽 {code}: 权重={signal_520_weight}, 情绪过滤")
+            signal_520_count["failed_gold_cross"] += 1
+            continue
+
+        passed, reason = filter_520_standard(s)
+        signal_520_results[code] = {"passed": passed, "reason": reason}
+        s["signal_520_passed"] = passed
+        s["signal_520_blocked_by"] = "" if passed else reason
+
+        # 龙回头检测（额外形态识别，不影响金叉筛选）
+        dragon = check_dragon_return_520(s)
+        s["dragon_return_520"] = dragon
+        if dragon["signal"]:
+            signal_520_count["dragon_return"] += 1
+            logging.info(f"  🐉 龙回头识别 {code} ({s.get('name','')}): {dragon['detail']}")
+
+        # 统计过滤原因
+        if passed:
+            signal_520_count["passed"] += 1
+            logging.info(f"  📈 520通过 {code} ({s.get('name','')}): {reason}")
+        else:
+            if any(kw in reason for kw in MA20_DOWN_KEYWORDS):
+                signal_520_count["failed_ma20_down"] += 1
+            elif any(kw in reason for kw in GOLD_CROSS_KEYWORDS):
+                signal_520_count["failed_gold_cross"] += 1
+            elif any(kw in reason for kw in VOLUME_KEYWORDS):
+                signal_520_count["failed_volume"] += 1
+            elif any(kw in reason for kw in BASICS_KEYWORDS):
+                signal_520_count["failed_basics"] += 1
+            else:
+                signal_520_count["failed_gold_cross"] += 1
+            logging.info(f"  📉 520未过 {code} ({s.get('name','')}): {reason}")
+
+    total_checked = len(kept)
+    log_detail = (
+        f"  520筛选: 通过{signal_520_count['passed']}/{total_checked} | "
+        f"MA20下行过滤{signal_520_count['failed_ma20_down']} | "
+        f"金叉/站稳过滤{signal_520_count['failed_gold_cross']} | "
+        f"放量不足{signal_520_count['failed_volume']} | "
+        f"基本面{signal_520_count['failed_basics']} | "
+        f"龙回头{signal_520_count['dragon_return']}"
+    )
+    logging.info(log_detail)
+    if signal_520_weight == 0.0:
+        logging.info(f"  🚨 M02情绪屏蔽: 520权重=0.0, 全部金叉信号强制失效")
+    elif signal_520_weight < 1.0:
+        logging.info(f"  ⚠️ M02情绪降级: 520权重={signal_520_weight}, 仅观察不生成候选")
+
+    # 4. 分层
     selected = {
         "core":   [s for s in kept if s.get("role") == "核心龙头"],
         "fill":   [s for s in kept if s.get("role") == "补涨备选"],
@@ -241,6 +435,20 @@ def run_module03(
         "violations": violations,
         "style_rule": style_rule,
         "psy_codes_added": psy_added,
+        "signal_520_results": signal_520_results,
+        "signal_520_passed_count": sum(1 for v in signal_520_results.values() if v['passed']),
+        "signal_520_count": signal_520_count,
+        "signal_520_weight": signal_520_weight,
+        "signal_520_weight_label": (
+            "正常(1.0)" if signal_520_weight >= 1.0
+            else "降级(0.4)" if signal_520_weight >= 0.4
+            else "屏蔽(0.0)"
+        ),
+        "signal_520_weight_tip": (
+            "多头趋势, 正常采信" if signal_520_weight >= 1.0
+            else "情绪中性/降级, 仅观察不生成候选" if signal_520_weight >= 0.4
+            else "情绪恶劣/熊市, 完全屏蔽520信号"
+        ),
     }
 
 

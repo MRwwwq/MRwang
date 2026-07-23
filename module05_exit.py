@@ -22,7 +22,115 @@ from psy_hit_manager import add_psy_code, get_psy_hit_count
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [M05] %(message)s", datefmt="%H:%M:%S")
 
 
-# ====================== 离场信号判定 ======================
+# ====================== 520多日追踪状态 ======================
+
+# 全局520追踪状态: {code: {"ma5_break_days": 0, "ma20_break_days": 0,
+#                            "last_ma5": None, "last_ma20": None}}
+_TRACK_520_STATE: dict = {}
+
+
+def reset_520_tracking():
+    """重置520追踪状态（盘前调用）。"""
+    global _TRACK_520_STATE
+    _TRACK_520_STATE = {}
+
+
+def track_520_multi_day(
+    code: str,
+    current_price: float,
+    ma5: float = None,
+    ma20: float = None,
+) -> dict:
+    """520多日追踪（有效跌破MA5/连续跌破MA20）。
+
+    持续跟踪:
+      - MA5跌破连续天数 (有效跌破=收盘<MA5)
+      - MA20跌破连续天数 (收盘<MA20)
+
+    返回:
+        {
+            "warning_level": "none"|"ma5_break"|"ma5_break_2days"|"ma20_break"|"ma20_break_2days"|"death_cross",
+            "ma5_break_days": int,
+            "ma20_break_days": int,
+            "detail": str,
+        }
+    """
+    global _TRACK_520_STATE
+    if code not in _TRACK_520_STATE:
+        _TRACK_520_STATE[code] = {"ma5_break_days": 0, "ma20_break_days": 0,
+                                   "from_date": ""}
+
+    state = _TRACK_520_STATE[code]
+
+    # 更新MA5跌破天数
+    if ma5 is not None and current_price < ma5:
+        state["ma5_break_days"] += 1
+    else:
+        state["ma5_break_days"] = 0  # 收回后重置
+
+    # 更新MA20跌破天数
+    if ma20 is not None and current_price < ma20:
+        state["ma20_break_days"] += 1
+    else:
+        state["ma20_break_days"] = 0
+
+    _TRACK_520_STATE[code] = state
+
+    # 判定预警级别
+    ma5_days = state["ma5_break_days"]
+    ma20_days = state["ma20_break_days"]
+
+    # 死叉: MA5 < MA20 (优先级最高)
+    if ma5 is not None and ma20 is not None and ma5 < ma20:
+        return {
+            "warning_level": "death_cross",
+            "ma5_break_days": ma5_days,
+            "ma20_break_days": ma20_days,
+            "detail": f"MA5({ma5:.2f})<MA20({ma20:.2f}) 死叉形成, 强制清仓",
+        }
+
+    # 连续2日跌破MA20
+    if ma20_days >= 2:
+        return {
+            "warning_level": "ma20_break_2days",
+            "ma5_break_days": ma5_days,
+            "ma20_break_days": ma20_days,
+            "detail": f"连续{ma20_days}日收盘<MA20({ma20:.2f}), 清仓止损预警",
+        }
+
+    # 有效跌破MA5且次日无法收回(≥2日)
+    if ma5_days >= 2:
+        return {
+            "warning_level": "ma5_break_2days",
+            "ma5_break_days": ma5_days,
+            "ma20_break_days": ma20_days,
+            "detail": f"连续{ma5_days}日收盘<MA5({ma5:.2f}), 短线减仓预警",
+        }
+
+    # 单日跌破MA5
+    if ma5_days == 1:
+        return {
+            "warning_level": "ma5_break",
+            "ma5_break_days": 1,
+            "ma20_break_days": ma20_days,
+            "detail": f"收盘{current_price:.2f}<MA5({ma5:.2f}), 短线减仓预警(第1日)",
+        }
+
+    # 单日跌破MA20
+    if ma20_days == 1:
+        return {
+            "warning_level": "ma20_break",
+            "ma5_break_days": 0,
+            "ma20_break_days": 1,
+            "detail": f"收盘{current_price:.2f}<MA20({ma20:.2f}), 清仓预警(第1日)",
+        }
+
+    return {
+        "warning_level": "none",
+        "ma5_break_days": 0,
+        "ma20_break_days": 0,
+        "detail": "均线多头, 价格运行正常",
+    }
 
 class ExitSignal:
     """单只持仓的离场信号集合"""
@@ -33,6 +141,10 @@ class ExitSignal:
     BREAK_LOW = "break_low"     # 跌破日内支撑低点
     BREAK_MIN = "break_min"     # 跌破日内最低价
     BOUNCE_FAIL = "bounce_fail" # 反弹无力突破成本
+    # 520均线监控信号
+    BREAK_MA5 = "break_ma5"     # 有效跌破MA5（短线减仓预警）
+    BREAK_MA20 = "break_ma20"   # 跌破MA20（清仓止损预警）
+    DEATH_CROSS = "death_cross" # 520死叉（强制清仓）
 
 
 def check_exit(
@@ -45,9 +157,11 @@ def check_exit(
     today_support: Optional[float] = None,
     session_high: Optional[float] = None,
     position_alloc_pct: Optional[float] = None,
+    ma5: Optional[float] = None,
+    ma20: Optional[float] = None,
 ) -> dict:
     """
-    单标的离场检查。
+    单标的离场检查（含520均线监控）。
 
     参数:
         code: 标的代码
@@ -59,6 +173,8 @@ def check_exit(
         today_support: 日内支撑低点 (技术面判定)
         session_high: 当日最高价 (用于反弹判定)
         position_alloc_pct: 持仓仓位占比
+        ma5: MA5均线值（520监控）
+        ma20: MA20均线值（520监控）
 
     返回:
         {
@@ -70,6 +186,8 @@ def check_exit(
             "action": "卖出" | "持有",
             "price_info": {...},
             "psy_codes_added": [...],
+            "ma5_warning": str,    # 520均线预警信息
+            "ma20_warning": str,
         }
     """
     info = {
@@ -150,14 +268,67 @@ def check_exit(
             "psy_codes_added": [],
         }
 
+    # ========== 四、520均线监控（多日追踪） ==========
+    ma5_warning = ""
+    ma20_warning = ""
+    if ma5 is not None and ma20 is not None:
+        # 520多日追踪
+        tracking = track_520_multi_day(code, current_price, ma5, ma20)
+
+        if tracking["warning_level"] == "death_cross":
+            return {
+                **info,
+                "signal": ExitSignal.DEATH_CROSS,
+                "signal_cn": "520死叉清仓",
+                "reason": tracking["detail"],
+                "action": "卖出",
+                "psy_codes_added": [],
+                "ma5_warning": f"MA5({ma5:.2f})<MA20({ma20:.2f})",
+                "ma20_warning": "520死叉, 强制清仓",
+                "520_tracking": tracking,
+            }
+
+        if tracking["warning_level"] == "ma20_break_2days":
+            # 连续2日跌破MA20 → 清仓离场预警
+            add_psy_code("code_04_避免怀疑")
+            return {
+                **info,
+                "signal": ExitSignal.BREAK_MA20,
+                "signal_cn": "连续跌破MA20清仓",
+                "reason": tracking["detail"],
+                "action": "卖出",
+                "psy_codes_added": ["code_04_避免怀疑"],
+                "ma5_warning": "",
+                "ma20_warning": tracking["detail"],
+                "520_tracking": tracking,
+            }
+
+        if tracking["warning_level"] == "ma5_break_2days":
+            # 连续2日跌破MA5 → 短线减仓预警 (加心理编码对冲损失厌恶)
+            add_psy_code("code_14_损失厌恶")
+            ma5_warning = tracking["detail"]
+            ma20_warning = ""
+            # 返回减仓预警但不强制卖出
+
+        if tracking["warning_level"] == "ma5_break":
+            ma5_warning = tracking["detail"]
+            ma20_warning = ""
+
+        if tracking["warning_level"] == "ma20_break":
+            ma5_warning = ""
+            ma20_warning = tracking["detail"]
+
     # ========== 无信号, 继续持有 ==========
     return {
         **info,
         "signal": ExitSignal.NONE,
         "signal_cn": "无信号",
-        "reason": f"亏损{abs(loss_pct):.1f}% 未达止损{stop_loss_pct}%, 日内结构无异常",
+        "reason": "均线多头, 价格运行正常",
         "action": "持有",
         "psy_codes_added": [],
+        "ma5_warning": ma5_warning,
+        "ma20_warning": ma20_warning,
+        "520_tracking": {"warning_level": "none", "ma5_break_days": 0, "ma20_break_days": 0, "detail": "均线多头, 价格运行正常"},
     }
 
 

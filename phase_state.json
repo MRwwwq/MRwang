@@ -1,0 +1,49 @@
+{
+  "current_phase": 2,
+  "phase_start": "2026-07-19",
+  "gates": {
+    "1": {
+      "data_complete": true,
+      "factor_stable": true,
+      "risk_blocking": true,
+      "review_running": true
+    },
+    "2": {
+      "lstm_converged": true,
+      "ppo_stable": true,
+      "market_state": true,
+      "multi_agent": true
+    },
+    "3": {}
+  },
+  "history": [
+    {
+      "from": 1,
+      "to": 2,
+      "time": "2026-07-19 02:49:35"
+    },
+    {
+      "from": 2,
+      "to": 1,
+      "time": "2026-07-19 02:49:36",
+      "reason": "manual_rollback"
+    },
+    {
+      "from": 1,
+      "to": 2,
+      "time": "2026-07-19 02:49:54"
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "time": "2026-07-19 02:49:54"
+    },
+    {
+      "from": 3,
+      "to": 2,
+      "time": "2026-07-19 02:49:54",
+      "reason": "manual_rollback"
+    }
+  ],
+  "blockers": []
+}

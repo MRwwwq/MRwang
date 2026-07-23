@@ -1,7 +1,12 @@
 #!/bin/bash
-# run_daily.sh v4 — 全自动化每日流程（含自适应自我修正）
+# run_daily.sh v5 — 全自动化每日流程（含自适应自我修正）
 # 采集 → 打分 → 情景推演 → 自我修正 → 交易信号 → 复盘统计 → 日报
 set -e
+
+# 确保使用正确的Python (cron默认PATH不含/usr/local/bin, 但Python3.11+所有包在此)
+export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+PYTHON_BIN=$(which python3)
+
 cd /opt/stock_agent
 
 DATE_ARG=${1:-$(date +%Y%m%d)}
@@ -34,7 +39,11 @@ fi
 
 # 1. 数据采集(批量全量)
 echo "[step 1] 采集数据(batch)..."
-python3 batch_collect.py $DATE_ARG 2>&1 | tee -a $LOG_DIR/run_$DATE_ARG.log
+if [ -f batch_collect.py ]; then
+    python3 batch_collect.py $DATE_ARG 2>&1 | tee -a $LOG_DIR/run_$DATE_ARG.log
+else
+    echo "  ⚠️ batch_collect.py 不存在, 跳过批量采集" | tee -a $LOG_DIR/run_$DATE_ARG.log
+fi
 echo "-------" >> $LOG_DIR/run_$DATE_ARG.log
 # Legacy single-stock import (if batch fails fallback)
 if [ -f stock_import_agent.py ]; then

@@ -1,0 +1,26 @@
+{
+  "versions": [
+    {
+      "version": "test_infra",
+      "time": "2026-07-19 02:47:12",
+      "files": 14,
+      "path": "/opt/stock_agent/snapshots/vtest_infra"
+    }
+  ],
+  "baseline_hash": {
+    "layered_risk_control.py": "df215cbd6e4f908e",
+    "static_hard_risk_control.py": "1b1db859143c1777",
+    "full_integrated_pipeline.py": "36a7c2d5f63da433",
+    "agent_orchestrator.py": "bfc782e967ad8db1",
+    "agent_risk_controller.py": "b7ea516f8ff5ca54",
+    "chain_logger.py": "ade9a0678cdafe79",
+    "code_isolation.py": "0854a87ad22a2ab2",
+    "agent_predict_v2.py": "d48fda10a20cfa02",
+    "agent_position.py": "0fb5b8f365f0a66f",
+    "dynamic_ai_risk.py": "4a30c768412d25f2",
+    "agent_selector.py": "5f7d16a7245051e3",
+    "factor_weekly_iterate.py": "01652bd6ab09622e",
+    "evolution_engine.py": "074181338daeb139",
+    "agent_evolver.py": "cb4bd9e9036a1587"
+  }
+}

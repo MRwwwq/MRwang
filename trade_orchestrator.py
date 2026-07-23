@@ -33,6 +33,21 @@ from layer0_collector import Layer0Collector
 from layer1_feature import run_layer1
 from layer2_decision import run_layer2
 
+# 盘后校准（v2.1）
+from post_market_calibration import run_calibration_pipeline, validate_completeness
+
+# 误判自愈权重衰减（v2.2）
+from self_heal_weight_decay import SelfHealWeightDecayUnit, run_self_heal_daily
+
+# 四层联动风控（v3.0）
+from four_layer_pipeline import FourLayerPipeline, run_four_layer_pipeline
+from layer0_macro import L0MacroHedgeChecker
+from layer3_reverse import Rule015ReverseChecker
+from rule021_dual_branch import Rule021DualBranchChecker, classify_stock_type, determine_risk_tier
+from dynamic_weight_mapping import MisjudgmentScoreCalculator, SignalStrengthScorer
+# 共振熔断进化（v3.1）
+from resonance_evolution import ResonanceEvolutionAgent, run_resonance_evolution, query_evolution_history
+
 # 旧版layer1_risk保留兼容引用
 from layer1_risk import judge_risk_level as old_judge_risk_level
 
@@ -111,6 +126,64 @@ MODULE_REGISTRY = {
         "entry": "run_layer2",
         "version": "2.0.0",
     },
+    "Step8_CALIB": {
+        "name": "盘后校准 — 10类标签+智能体自修正",
+        "file": "post_market_calibration.py",
+        "defined": True,
+        "entry": "run_calibration_pipeline",
+        "version": "2.1.0",
+    },
+    "StepS_HEAL": {
+        "name": "误判自愈衰减 — 乐观误判权重自主消解",
+        "file": "self_heal_weight_decay.py",
+        "defined": True,
+        "entry": "SelfHealWeightDecayUnit / run_self_heal_daily",
+        "version": "2.2.0",
+    },
+    # === 四层联动风控 v3.0 ===
+    "Layer0_MACRO": {
+        "name": "宏观对冲校验层 — 顶层前置修正系数",
+        "file": "layer0_macro.py",
+        "defined": True,
+        "entry": "L0MacroHedgeChecker.check",
+        "version": "3.0.0",
+    },
+    "Layer1_R021": {
+        "name": "Rule021基础打分 — 双分支五维+阶梯+雷区",
+        "file": "rule021_dual_branch.py",
+        "defined": True,
+        "entry": "Rule021DualBranchChecker.check",
+        "version": "3.0.0",
+    },
+    "Layer2_DWM": {
+        "name": "全量误判动态加权 — 衰减/冲突/自愈/加权",
+        "file": "dynamic_weight_mapping.py",
+        "defined": True,
+        "entry": "MisjudgmentScoreCalculator.calculate",
+        "version": "3.0.0",
+    },
+    "Layer3_R015": {
+        "name": "双重共振反转校验 — 基本面强支撑兜底反转",
+        "file": "layer3_reverse.py",
+        "defined": True,
+        "entry": "Rule015ReverseChecker.check",
+        "version": "3.0.0",
+    },
+    "FourLayerPipeline": {
+        "name": "四层联动全链路编排器 — L0→L1→L2→L3→阈值",
+        "file": "four_layer_pipeline.py",
+        "defined": True,
+        "entry": "run_four_layer_pipeline",
+        "version": "3.0.0",
+    },
+    # === 共振熔断进化 v3.1 ===
+    "StepX_EVOLVE": {
+        "name": "共振熔断进化 — Lollapalooza+RED自动迭代参数",
+        "file": "resonance_evolution.py",
+        "defined": True,
+        "entry": "ResonanceEvolutionAgent.run",
+        "version": "3.1.0",
+    },
 }
 
 
@@ -145,6 +218,90 @@ class DailyPipeline:
         logging.info(f"✅ Step0: 初始化完成——psy_hit_codes已清空, {len(MODULE_REGISTRY)}个模块已注册")
         return result
 
+    def step_self_heal(self) -> dict:
+        """
+        StepS: 误判自愈衰减扫描。
+
+        执行时机: 每日开盘前(Step0之后, Step1之前)。
+        作用: 对所有活跃自愈样本执行到期权重衰减，
+              自动将衰减后的权重同步到dynamic_signal_mapping表，
+              使评分引擎自动使用低权重。
+        """
+        logging.info(f"\n--- StepS: 误判自愈衰减扫描 ---")
+        try:
+            result = run_self_heal_daily(self.trade_date)
+            self.ctx["self_heal"] = result
+            self.log["step_self_heal"] = {
+                "active_before": result["summary"]["active_samples"],
+                "decayed": result["decay_result"]["decayed"],
+                "new_completed": result["decay_result"]["completed"],
+            }
+            status_icon = "🏥"
+            if result["decay_result"]["completed"] > 0:
+                status_icon = "🏁"
+            logging.info(f"  {status_icon} 自愈衰减: "
+                         f"活跃{result['summary']['active_samples']}条, "
+                         f"衰减{result['decay_result']['decayed']}次, "
+                         f"新完成{result['decay_result']['completed']}条")
+            return result
+        except Exception as e:
+            logging.warning(f"  ⚠️ 自愈衰减扫描失败: {e}")
+            result = {"skipped": True, "error": str(e)}
+            self.ctx["self_heal"] = result
+            self.log["step_self_heal"] = {"error": str(e)}
+            return result
+
+    def _build_stock_context(self, step3_result: dict) -> dict:
+        """
+        从Module03结果构建标的上下文，用于Rule021双分支分类。
+
+        step3_result格式:
+            {"main_line": ..., "selected_filtered": {...}, "selected_raw": {...}, ...}
+        """
+        selected_filtered = step3_result.get("selected_filtered", {})
+        selected_raw = step3_result.get("selected_raw", {})
+        stocks_raw = step3_result.get("stocks_raw", [])
+        if isinstance(stocks_raw, int):
+            stocks_raw = []
+
+        pool = []
+        for layer in ["core", "fill", "latent"]:
+            pool.extend(selected_filtered.get(layer, []))
+        # 兜底：selected_raw
+        if not pool:
+            for layer in ["core", "fill", "latent"]:
+                pool.extend(selected_raw.get(layer, []))
+        # 兜底：stocks_raw
+        if not pool and stocks_raw:
+            pool = stocks_raw
+
+        if not pool:
+            return None
+
+        # 取第一个标的作为上下文
+        first = pool[0] if isinstance(pool, list) else pool
+        return {
+            "stock_code": first.get("code", ""),
+            "stock_name": first.get("name", ""),
+            "sector": first.get("sector", "") or step3_result.get("main_line", ""),
+            "business_desc": first.get("reason", ""),
+            "stock_data": {
+                "commodity_price_percentile": first.get("commodity_pct", 50),
+                "capacity_stability": first.get("capacity", "full"),
+                "cost_position": first.get("cost", "mid"),
+                "ore_grade": first.get("ore_grade", "mid"),
+                "debt_ratio": first.get("debt_ratio", 50),
+                "pe_percentile": first.get("pe_pct", 50),
+                "production_cost": first.get("production_cost", 50),
+                "policy_score": first.get("policy_score", 50),
+                "board_heat": first.get("board_heat", 50),
+                "concept_purity": first.get("purity", 50),
+                "fund_inflow": first.get("fund_inflow", 0),
+                "chip_concentration": first.get("chip_conc", 50),
+                "remaining_catalysts": first.get("remaining_catalysts", 50),
+            },
+        }
+
     def step1_style(self, trade_period: str, capital_type: str,
                     total_pct: int, per_stock_pct: int, stop_loss: float) -> dict:
         """Step1: 定风格"""
@@ -170,6 +327,7 @@ class DailyPipeline:
         self.ctx["step2"] = result
         self.ctx["sentiment_label"] = result["sentiment_label"]
         self.ctx["final_total_cap"] = result["final_total_cap"]
+        self.ctx["signal_520_weight"] = result.get("signal_520_weight", 1.0)  # ← 保存520权重
         self.log["step2"] = result
         return result
 
@@ -178,10 +336,13 @@ class DailyPipeline:
         """Step3: 定方向"""
         logging.info(f"\n--- Step3: 定方向 ---")
         active_style = self.ctx.get("active_style", "D")
+        signal_520_weight = self.ctx.get("signal_520_weight", 1.0)
         result = run_module03(main_line, driver_type, driver_detail,
-                              candidate_stocks, active_style)
+                              candidate_stocks, active_style,
+                              signal_520_weight=signal_520_weight)
         self.ctx["step3"] = result
         self.ctx["selected_filtered"] = result["selected_filtered"]
+        self.ctx["signal_520_count"] = result.get("signal_520_count", {})
         self.log["step3"] = result
         return result
 
@@ -195,15 +356,74 @@ class DailyPipeline:
         stop_loss = self.ctx.get("style_stop_loss", 2.0)
         sentiment_label = self.ctx.get("sentiment_label", "recovery")
         selected = self.ctx.get("selected_filtered", {"core": [], "fill": [], "latent": []})
+        main_line = self.ctx.get("step3", {}).get("main_line", "")
+        signal_520_weight = self.ctx.get("signal_520_weight", 1.0)
 
         result = run_module04(active_style, style_name, total_cap,
-                              per_stock_max, stop_loss, sentiment_label, selected)
+                              per_stock_max, stop_loss, sentiment_label, selected,
+                              main_line=main_line, signal_520_weight=signal_520_weight)
         self.ctx["step4"] = result
         self.ctx["tradeable_pool"] = result["tradeable_pool"]
         self.log["step4"] = result
         return result
 
-    # ====================== 三层风控流水线 (v2.0) ======================
+    # ====================== 520复盘输出 ======================
+
+    def step_review_520(self) -> dict:
+        """StepR: 520交易信号复盘输出（固定5项统计）。"""
+        logging.info(f"\n--- StepR: 520复盘 ---")
+        from module_review_520 import build_review
+
+        # 从M03读取520筛选统计
+        m03 = self.ctx.get("step3", {})
+        s520_count = m03.get("signal_520_count", {})
+
+        total_candidates_c5 = m03.get("stocks_raw", 0)  # M03原始候选数
+        if isinstance(total_candidates_c5, int) and total_candidates_c5 == 0:
+            # 改用selected_raw + eliminated求和
+            selected_raw = m03.get("selected_raw", {})
+            eliminated = m03.get("eliminated", [])
+            total_candidates_c5 = (
+                sum(len(v) for v in selected_raw.values()) + len(eliminated)
+            )
+
+        gold_cross_valid = s520_count.get("passed", 0)
+        ma20_down_filtered = s520_count.get("failed_ma20_down", 0)
+        sentiment_m02_downgraded = 0
+        if self.ctx.get("signal_520_weight", 1.0) < 1.0:
+            sentiment_m02_downgraded = gold_cross_valid  # 全部被情绪降级
+
+        # 从M04读取芒格拦截
+        m04 = self.ctx.get("step4", {})
+        lolla_blocked = m04.get("lolla_blocked_count", 0)
+
+        # 从M04读取最终交易池
+        tradeable_pool = m04.get("tradeable_pool", [])
+        final_pool_size = len(tradeable_pool)
+
+        sentiment_label = self.ctx.get("sentiment_label", "")
+        signal_520_weight = self.ctx.get("signal_520_weight", 1.0)
+
+        report = build_review(
+            total_candidates=total_candidates_c5,
+            gold_cross_count=gold_cross_valid,
+            ma20_down_filtered=ma20_down_filtered,
+            sentiment_downgraded=sentiment_m02_downgraded,
+            lolla_blocked=lolla_blocked,
+            final_pool_size=final_pool_size,
+            sentiment_label=sentiment_label,
+            signal_520_weight=signal_520_weight,
+            market_trend=m03.get("signal_520_weight_label", ""),
+        )
+
+        # 龙回头数量
+        dragon_count = m04.get("dragon_return_count", 0)
+        if dragon_count > 0:
+            logging.info(f"  🐉 龙回头识别: {dragon_count}只")
+
+        self.ctx["step_review_520"] = report
+        self.log["step_review_520"] = report
+        return report
 
     def step5_layer0(self,
                      tech_data: dict = None,
@@ -259,7 +479,11 @@ class DailyPipeline:
         logging.info(f"\n--- Step6: Layer1 特征校验层 ---")
         signal_output = self.ctx.get("signal_output", {})
 
-        result = run_layer1(signal_output)
+        # 从Module03提取标的上下文用于Rule021双分支分类
+        m03 = self.ctx.get("step3", {})
+        stock_context = self._build_stock_context(m03)
+
+        result = run_layer1(signal_output, stock_context)
         self.ctx["step6"] = result
         self.ctx["layer1_result"] = result
         self.log["step6_layer1"] = {
@@ -320,6 +544,199 @@ class DailyPipeline:
                      f"新开仓={'允许' if decision['rule']['new_open_allowed'] else '禁止'}")
         return market_open
 
+    # ====================== 四层联动风控 (v3.0) ======================
+
+    def stepS_macro_layer(self,
+                          commodity_data: dict = None,
+                          monetary_data: dict = None,
+                          reserve_data: dict = None) -> dict:
+        logging.info(f"\n--- StepS: L0 宏观对冲校验 ---")
+        checker = L0MacroHedgeChecker()
+        result = checker.check(
+            commodity_data=commodity_data,
+            monetary_data=monetary_data,
+            reserve_data=reserve_data,
+        )
+        self.ctx["macro_coefficient"] = result["macro_coefficient"]
+        self.ctx["macro_result"] = result
+        self.log["stepS_macro"] = {
+            "verdict": result["macro_verdict"],
+            "coefficient": result["macro_coefficient"],
+        }
+        logging.info(f"  L0宏观: {result['macro_label']} 系数={result['macro_coefficient']}")
+        return result
+
+    def stepT_rule021(self, deduction_count: int = 0) -> dict:
+        logging.info(f"\n--- StepT: L1 Rule021 基础打分 ---")
+        ctx = self.ctx.get("stock_context", {})
+        macro_coeff = self.ctx.get("macro_coefficient", 1.0)
+
+        l1 = Rule021DualBranchChecker()
+        l1_result = l1.check(
+            stock_code=ctx.get("stock_code", ""),
+            stock_name=ctx.get("stock_name", ""),
+            sector=ctx.get("sector", ""),
+            business_desc=ctx.get("business_desc", ""),
+            stock_data=ctx.get("stock_data", {}),
+            deduction_count=deduction_count,
+        )
+        base_score = l1_result["final_risk_score"]
+        macro_adjusted = round(base_score * macro_coeff, 1)
+
+        self.ctx["l1_result"] = l1_result
+        self.ctx["l1_macro_adjusted"] = macro_adjusted
+        self.ctx["stock_type"] = l1_result.get("branch", "concept")
+        self.log["stepT_rule021"] = {
+            "branch": l1_result.get("branch_label", ""),
+            "base_score": base_score,
+            "macro_adjusted": macro_adjusted,
+            "high_risk_count": l1_result.get("high_risk_count", 0),
+        }
+        logging.info(f"  L1 Rule021: base={base_score:.1f}->adj={macro_adjusted:.1f}")
+        return l1_result
+
+    def stepU_weighted(self, factor_values: dict = None) -> dict:
+        logging.info(f"\n--- StepU: L2 全量误判动态加权 ---")
+        macro_adjusted = self.ctx.get("l1_macro_adjusted", 0)
+        l2_total = 0
+        l2_result = {}
+
+        if factor_values:
+            try:
+                scorer = MisjudgmentScoreCalculator()
+                l2_result = scorer.calculate(factor_values=factor_values)
+                l2_total = l2_result.get("total_score", 0)
+            except Exception as e:
+                logging.warning(f"  L2计算异常: {e}")
+
+        fused_score = round(macro_adjusted * 0.7 + l2_total * 0.3, 1)
+        self.ctx["l2_fused_score"] = fused_score
+        self.ctx["l2_result"] = l2_result
+        self.log["stepU_weighted"] = {
+            "l2_score": l2_total,
+            "fused_score": fused_score,
+        }
+        logging.info(f"  L2加权: L2={l2_total:.1f} 融合={fused_score:.1f}")
+        return {"l2_score": l2_total, "fused_score": fused_score}
+
+    def stepV_reverse(self, stock_data: dict = None) -> dict:
+        logging.info(f"\n--- StepV: L3 双重共振反转 ---")
+        stock_type = self.ctx.get("stock_type", "concept")
+        fused_score = self.ctx.get("l2_fused_score", 0)
+        l1_result = self.ctx.get("l1_result", {})
+        current_tier = l1_result.get("risk_tier", "GREEN")
+
+        checker = Rule015ReverseChecker()
+        l3_result = checker.check(
+            stock_type=stock_type,
+            stock_data=stock_data or {},
+            final_risk_score=fused_score,
+            risk_tier=current_tier,
+        )
+        adjusted_score = l3_result["adjusted_score"]
+        adjusted_tier = l3_result["adjusted_tier"]
+
+        self.ctx["l3_result"] = l3_result
+        self.ctx["l3_adjusted_score"] = adjusted_score
+        self.ctx["l3_adjusted_tier"] = adjusted_tier
+        self.log["stepV_reverse"] = {
+            "resonance": l3_result["resonance_level"],
+            "score_before": fused_score,
+            "score_after": adjusted_score,
+            "tier_before": current_tier,
+            "tier_after": adjusted_tier,
+        }
+        logging.info(f"  L3反转: {l3_result['resonance_level']} "
+                     f"{fused_score:.1f}->{adjusted_score:.1f} "
+                     f"{current_tier}->{adjusted_tier}")
+        return l3_result
+
+    def stepW_threshold(self) -> dict:
+        logging.info(f"\n--- StepW: 赛道阈值判定 ---\n")
+
+        stock_type = self.ctx.get("stock_type", "concept")
+        l3_result = self.ctx.get("l3_result", {})
+
+        if l3_result.get("tier_downgrade_applied"):
+            tier = l3_result["adjusted_tier"]
+            score = l3_result["adjusted_score"]
+        else:
+            score = self.ctx.get("l3_adjusted_score",
+                                 self.ctx.get("l2_fused_score", 0))
+            tier_info = determine_risk_tier(stock_type, score)
+            tier = tier_info["tier"]
+
+        RISK_ACTION = {
+            "RED": "拦截禁止新开仓;已有持仓启动强制减仓/止损",
+            "YELLOW": "开启重点监控,下调仓位权重,不强制减仓",
+            "GREEN": "放开约束,正常执行预设交易策略",
+        }
+        action = RISK_ACTION.get(tier, "未知等级")
+
+        final = {"risk_tier": tier, "risk_action": action,
+                 "final_score": score, "stock_type": stock_type}
+        self.ctx["v3_risk_tier"] = tier
+        self.ctx["v3_risk_action"] = action
+        self.log["stepW_threshold"] = final
+        icon = {"RED": "RED", "YELLOW": "YELLOW", "GREEN": "GREEN"}.get(tier, "?")
+        logging.info(f"  最终判定: {icon} {tier} | {action}")
+        return final
+
+    def run_four_layer_v3(self,
+                          stock_code="", stock_name="", sector="",
+                          business_desc="",
+                          commodity_data=None, monetary_data=None,
+                          reserve_data=None,
+                          stock_data=None, deduction_count=0,
+                          factor_values=None) -> dict:
+        """一键执行四层联动风控 v3.0。"""
+        self.ctx["stock_context"] = {
+            "stock_code": stock_code, "stock_name": stock_name,
+            "sector": sector, "business_desc": business_desc,
+            "stock_data": stock_data or {},
+        }
+        self.stepS_macro_layer(
+            commodity_data=commodity_data,
+            monetary_data=monetary_data,
+            reserve_data=reserve_data,
+        )
+        self.stepT_rule021(deduction_count=deduction_count)
+        self.stepU_weighted(factor_values=factor_values)
+        self.stepV_reverse(stock_data=stock_data)
+        return self.stepW_threshold()
+
+    # ====================== Step8: 盘后校准 (v2.1) ======================
+
+    def step8_post_calibration(self, records: list[dict] = None) -> dict:
+        """
+        Step8: 盘后校准流水线。
+
+        收盘后执行: 归集当日全部标的 → 自动匹配10类标签
+        → 完整性校验 → 推送智能体离线迭代
+
+        参数:
+            records: [{ts_code, ai_pred, ai_risk_tip, real_change_pct,
+                       close_price, support_resistance, real_trade_action,
+                       short_attribution}]
+
+        返回: 校准结果字典
+        """
+        logging.info(f"\n--- Step8: 盘后校准 ---")
+        if not records:
+            logging.info("  ⏭️  无校准记录, 跳过")
+            return {"skipped": True}
+
+        result = run_calibration_pipeline(records)
+        self.ctx["step8"] = result
+        self.ctx["calibration_result"] = result
+        self.log["step8_calibration"] = {
+            "total": result["import_result"]["total"],
+            "tagged": result["import_result"]["tagged"],
+            "status": result["completeness"]["status"],
+            "iterated": result["iteration_result"].get("iterated", False),
+        }
+        return result
+
     # ====================== 兼容旧版接口 ======================
 
     def step5_legacy(self, lolla_triggered: bool = False, lolla_high_count: int = 0) -> dict:
@@ -352,6 +769,8 @@ class DailyPipeline:
         sent_data: dict = None,
         ind_data: dict = None,
         macro_data: dict = None,
+        # 调度模式
+        schedule_mode: str = "C",  # A=全流水线, B=盘中调整, C=单模块(默认)
     ) -> dict:
         """
         一键运行全流程 (Step0~7):
@@ -371,10 +790,23 @@ class DailyPipeline:
             }
         """
         self.step0_init()
-        self.step1_style(trade_period, capital_type, total_pct, per_stock_pct, stop_loss)
+        self.step_self_heal()  # 开盘前衰减扫描
+
+        if schedule_mode in ("A", "B"):
+            # 模式A/B: 全链重跑 (含M00/M01)
+            self.step1_style(trade_period, capital_type, total_pct, per_stock_pct, stop_loss)
+        else:
+            # 模式C: 复用M00/M01缓存, 仅从M02开始
+            # M01结果仍需要 (由外部传入或缓存)
+            self.step1_style(trade_period, capital_type, total_pct, per_stock_pct, stop_loss)
+
+        # M02~M05 始终执行
         self.step2_sentiment(up_count, down_count, highest_board, seal_rate, blow_rate, has_massacre)
         self.step3_direction(main_line, driver_type, driver_detail, candidate_stocks)
         self.step4_strategy()
+
+        # 520复盘 (新增)
+        self.step_review_520()
 
         # 三层风控流水线
         self.step5_layer0(tech_data=tech_data, fund_data=fund_data,
@@ -387,7 +819,8 @@ class DailyPipeline:
         return {
             "trade_date": self.trade_date,
             "pipeline_complete": True,
-            "pipeline_version": "2.0 三层风控",
+            "pipeline_version": "2.0 三层风控 + 520全嵌入",
+            "schedule_mode": schedule_mode,
             "modules_executed": list(self.log.keys()),
             "risk_level": decision["risk_level"],
             "risk_label": decision["label"],
@@ -398,6 +831,9 @@ class DailyPipeline:
             "layer1_psy_count": l1_result.get("psy_count", 0),
             "final_psy_hit_count": get_psy_hit_count(),
             "psy_hit_codes": psy_hit_codes.copy(),
+            "signal_520_weight": self.ctx.get("signal_520_weight", 1.0),
+            "signal_520_review": self.ctx.get("step_review_520", {}),
+            "signal_520_count": self.ctx.get("signal_520_count", {}),
         }
 
 
