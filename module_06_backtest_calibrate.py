@@ -56,6 +56,36 @@ BOUNDARY_TABLE = "module06_evolution_boundary"  # 参数进化边界锁表
 TODAY = datetime.now().strftime("%Y-%m-%d")
 TRADE_DATE = TODAY
 
+# ═══════════════════════════════════════════
+#  全自动模式全局标识 & 缓存工具
+# ═══════════════════════════════════════════
+# --auto 在 sys.argv 中：操作二/三自动跳过 input()，读取缓存文件执行
+is_auto_run = "--auto" in sys.argv
+
+CACHE_DIR = Path("/opt/data/cache")
+VULN_CACHE = CACHE_DIR / "daily_vuln_auto.cache"
+BOUNDARY_CACHE = CACHE_DIR / "daily_boundary_auto.cache"
+
+
+def load_cache_file(path: Path) -> list:
+    """读取缓存JSON文件，返回list；文件不存在/空/无效时返回[]"""
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return []
+    except (json.JSONDecodeError, Exception):
+        return []
+
+
+def send_review_log(msg: str):
+    """写入复盘日志摘要（附加到当日日志）"""
+    log.info(msg)
+    print(f"  {msg}")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [M06] %(message)s",
@@ -527,17 +557,38 @@ def sync_vuln_to_modules(trade_date, vuln_category, severity, fix_patch):
         log.info(f"  → Layer2 风控条件补丁: {act}")
 
 
-def record_vuln_and_notify(auto_mode=False):
-    """交互式记录研判漏洞（人工录入）
-    
-    Args:
-        auto_mode: True时跳过交互，仅在cron/自动化场景报告无漏洞记录
+def record_vuln_and_notify():
     """
-    if auto_mode:
-        print("  ℹ️ 自动模式: 跳过人工漏洞修正（需人工补充隐性信息盲区）")
-        print("  ℹ️ 可在收盘后手动执行: python3 module_06_backtest_calibrate.py --vuln")
+    操作二：人工研判漏洞修正
+    is_auto_run=True → 读取缓存文件自动执行，跳过全部 input()
+    is_auto_run=False → 交互式 input() 录入（保留原逻辑）
+    """
+    if is_auto_run:
+        # ── 全自动分支：读取缓存，跳过 input() ──
+        vuln_data = load_cache_file(VULN_CACHE)
+        if not vuln_data:
+            send_review_log("【AUTO】漏洞缓存为空，跳过操作二（手动创建 daily_vuln_auto.cache 可启用）")
+            return
+
+        count = 0
+        for entry in vuln_data:
+            ticker = entry.get("ticker", "")
+            cat = entry.get("category", "C01")
+            sev = entry.get("severity", "L1")
+            ai_c = entry.get("ai_conclusion", "")
+            real = entry.get("real_fact", "")
+            patch = entry.get("fix_patch", "")
+            notes = entry.get("notes", "")
+
+            save_vulnerability(TRADE_DATE, ticker, cat, entry.get("subtype", ""),
+                               sev, ai_c, real, patch, notes)
+            sync_vuln_to_modules(TRADE_DATE, cat, sev, patch)
+            count += 1
+
+        send_review_log(f"【AUTO】自动化漏洞记录完成: {count}条（缓存: {VULN_CACHE}）")
         return
 
+    # ── 人工模式：保留原有全部 input() 交互式录入 ──
     print("\n" + "=" * 60)
     print("  【操作二】人工研判漏洞修正")
     print("=" * 60)
@@ -912,13 +963,11 @@ def check_boundary_hit_days(trade_date: str, param_category: str = None) -> dict
     return {"alert": False, "message": "无连续边界逼近风险"}
 
 
-def record_boundary_and_notify(auto_mode=False):
+def record_boundary_and_notify():
     """
-    操作三完整流程：
-    步骤1→步骤2→步骤3→步骤4
-    
-    Args:
-        auto_mode: True时使用默认边界写入锁并退出，跳过交互式设置
+    操作三：参数进化边界设置（防过拟合）
+    is_auto_run=True → 读取缓存文件写入锁，跳过全部 input()
+    is_auto_run=False → 交互式 input() 设置（保留原逻辑）
     """
     print("\n" + "=" * 60)
     print("  【操作三】人工限制参数进化边界（防过拟合）")
@@ -927,17 +976,41 @@ def record_boundary_and_notify(auto_mode=False):
     # 步骤1：参数偏移报告
     print("\n" + generate_boundary_drift_report(TRADE_DATE))
 
-    if auto_mode:
-        print("\n  ℹ️ 自动模式: 使用BOUNDARY_RULES默认边界写入锁")
-        # 步骤3：直接使用默认边界写入锁
-        lock_path, lock_count = apply_boundary_locks(TRADE_DATE)
-        print(f"  ✅ 参数锁已写入: {lock_path} ({lock_count}项)")
+    if is_auto_run:
+        # ── 全自动分支：读取缓存/默认值，跳过 input() ──
+        boundary_data = load_cache_file(BOUNDARY_CACHE)
+        if boundary_data:
+            count = 0
+            for entry in boundary_data:
+                cat = entry.get("category", "")
+                pname = entry.get("name", "")
+                if not cat or not pname:
+                    continue
+                desc = entry.get("desc", "")
+                baseline = entry.get("baseline", "")
+                hmin = entry.get("hard_min", "")
+                hmax = entry.get("hard_max", "")
+                drift = entry.get("actual_drift", "")
+                validity = entry.get("validity", "长期永久")
+                risk_level = entry.get("risk_level", "L1")
+                notes = entry.get("notes", "")
+                save_evolution_boundary(TRADE_DATE, cat, pname, desc,
+                                        baseline, hmin, hmax, drift,
+                                        validity, risk_level, notes)
+                count += 1
+            lock_path, lock_count = apply_boundary_locks(TRADE_DATE)
+            send_review_log(f"【AUTO】边界缓存执行: {count}条写入, 锁{lock_count}项（缓存: {BOUNDARY_CACHE}）")
+        else:
+            # 缓存为空→使用BOUNDARY_RULES默认边界写入锁
+            lock_path, lock_count = apply_boundary_locks(TRADE_DATE)
+            send_review_log(f"【AUTO】边界缓存为空，使用默认BOUNDARY_RULES: 锁{lock_count}项")
+
         print(f"\n{'='*60}")
         print(f"  【操作三】完成（自动模式）")
         print(f"{'='*60}")
         return
 
-    # 步骤2: 选择类别
+    # ── 人工模式：保留原有全部 input() 交互式设置 ──
     print("\n参数类别:")
     cat_list = list(BOUNDARY_RULES.keys())
     for i, cat in enumerate(cat_list, 1):
@@ -1369,14 +1442,14 @@ def main():
         print("\n" + "=" * 60)
         print("  【操作二】人工研判漏洞修正")
         print("=" * 60)
-        record_vuln_and_notify(auto_mode=args.auto)
+        record_vuln_and_notify()
 
     # 8. 如果同时指定 --boundary，执行操作三
     if args.boundary:
         print("\n" + "=" * 60)
         print("  【操作三】参数进化边界设置（防过拟合）")
         print("=" * 60)
-        record_boundary_and_notify(auto_mode=args.auto)
+        record_boundary_and_notify()
 
     print(f"\n{'='*60}")
     print(f"  Module_06 完成")
