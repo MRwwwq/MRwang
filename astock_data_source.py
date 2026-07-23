@@ -51,9 +51,21 @@ logger = logging.getLogger("AstockSource")
 # ═══════════════════════════════════════════════
 
 ASTOCK_HOME = os.environ.get(
-    "ASTOCK_HOME",
-    "/opt/astock-data-toolkit/astock_data"
+    "ASTOCK_HOME", ""
 )
+if not ASTOCK_HOME:
+    # 优先检测 D盘挂载点 /opt/qclaw, 其次原路径
+    for candidate in [
+        "/opt/qclaw/astock-data-toolkit/astock_data",
+        "/opt/astock-data-toolkit/astock_data",
+    ]:
+        p = Path(candidate)
+        if p.parent.exists():
+            ASTOCK_HOME = candidate
+            break
+    else:
+        ASTOCK_HOME = "/opt/qclaw/astock-data-toolkit/astock_data"  # 默认指向D盘
+
 ASTOCK_REPO = Path(ASTOCK_HOME).parent  # repo根目录
 
 DATA_DIR = Path(ASTOCK_HOME)
