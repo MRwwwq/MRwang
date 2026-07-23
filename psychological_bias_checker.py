@@ -6,7 +6,7 @@ psychological_bias_checker.py — 25类人类心理误判量化检测引擎
 每分析一只个股，自动执行本模块：
 - 25类误判因子实时量化评分
 - 单因子高分→预警
-- ≥3类同向因子共振→标记Lollapalooza高风险→风控一票否决
+- ≥6类同向因子共振→标记Lollapalooza高风险→风控一票否决
 - 校验结果插入报告风险板块
 
 用法: python3 psychological_bias_checker.py <stock_code>
@@ -473,14 +473,14 @@ class BiasChecker:
             "detail": ""
         }
         
-        # 判定共振
-        if len(bullish_biases) >= 3:
+        # 判定共振 (阈值已调整为>=6, 2026-07-23修改)
+        if len(bullish_biases) >= 6:
             result["lollapalooza_active"] = True
             result["direction"] = "bull"
             result["score"] = len(bullish_biases) * 2
             result["detail"] = f"正向泡沫共振: {len(bullish_biases)}类同向因子(奖励反馈+社会认同+过度乐观+嫉妒)"
             
-        if len(bearish_biases) >= 3:
+        if len(bearish_biases) >= 6:
             result["lollapalooza_active"] = True
             result["direction"] = "bear"
             result["score"] = max(result["score"], len(bearish_biases) * 2)
@@ -527,9 +527,9 @@ class BiasChecker:
                 "bearish_count": self.results.get("bias_25_lollapalooza", {}).get("bearish_count", 0)
             },
             "triggered_list": triggered,
-            "veto_active": self.lollapalooza_count >= 3,
+            "veto_active": self.lollapalooza_count >= 6,
             "conclusion": (
-                "🚫 Lollapalooza高风险→风控一票否决" if self.lollapalooza_count >= 3
+                "🚫 Lollapalooza高风险→风控一票否决" if self.lollapalooza_count >= 6
                 else f"⚠️ 触发{len(triggered)}类偏差,需关注" if len(triggered) >= 2
                 else "✅ 心理偏差风险可控"
             )

@@ -28,7 +28,7 @@ ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()
 
 SCORE_THRESHOLD = 60       # 单因子高分阈值
-RESONANCE_COUNT = 3        # 达到3项高分即触发Lollapalooza共振预警
+RESONANCE_COUNT = 6        # 达到6项高分才触发Lollapalooza共振预警（原为3项，放宽过滤轻度偏误）
 LOOK_BACK_DAY = 20         # 回溯20个交易日计算情绪因子
 
 
