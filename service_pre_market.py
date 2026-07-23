@@ -234,19 +234,26 @@ def step4_health_check() -> dict:
 
     # 4a. 各模块连通性自检
     modules = {
-        "MISJUDGE_MATCH(RAG)": True,  # 模拟: 实际应发探测请求
-        "财务数据源": True,
-        "行情数据源": True,
+        "MISJUDGE_MATCH(RAG)": True,
+        "AStock本地数据湖": False,
+        "Tushare数据源": True,
         "MQ消费队列": True,
     }
 
-    # 模拟检测结果(生产环境替换为真实探测)
-    import random
-    for mod in list(modules.keys()):
-        ok = random.random() > 0.05  # 95%概率正常
-        modules[mod] = ok
-        if not ok:
-            result["alerts"].append(f"{mod}不可用")
+    # AStock Data Toolkit 真实检查
+    try:
+        from astock_data_source import get_data_health
+        h = get_data_health()
+        parquet_available = sum(1 for v in h.values() if v["exists"])
+        modules["AStock本地数据湖"] = parquet_available >= 3
+        if parquet_available > 0:
+            if parquet_available < 3:
+                result["alerts"].append(f"AStock数据湖部分就绪({parquet_available}/6表)")
+            else:
+                logging.info(f"  ✅ AStock数据湖健康: {parquet_available}/6表")
+    except ImportError:
+        modules["AStock本地数据湖"] = False
+        result["alerts"].append("AStock Data Toolkit 未安装")
 
     result["modules"] = modules
 
@@ -256,8 +263,8 @@ def step4_health_check() -> dict:
     if failed_count >= 3:
         result["pre_degradation"] = 3
     elif failed_count >= 1:
-        # 检查是否包含财务数据源
-        if not modules.get("财务数据源", True):
+        # 检查是否包含AStock数据湖故障(本地数据缺失=需降级到Tushare)
+        if not modules.get("AStock本地数据湖", True):
             result["pre_degradation"] = 2
         else:
             result["pre_degradation"] = 1
@@ -269,7 +276,7 @@ def step4_health_check() -> dict:
         mgr = get_degradation_manager()
         mgr.detect_fault_level(
             rag_available=modules.get("MISJUDGE_MATCH(RAG)", True),
-            financial_available=modules.get("财务数据源", True),
+            financial_available=modules.get("AStock本地数据湖", True),
             multi_module_failure=(failed_count >= 3),
         )
         result["pre_degradation_activated"] = f"等级{result['pre_degradation']}"

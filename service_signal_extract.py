@@ -15,6 +15,28 @@ service_signal_extract.py — SIGNAL_EXTRACT 信号提取微服务
 import logging
 from typing import Optional
 
+# ── AStock Data Toolkit 集成 ──
+_ASTOCK_SOURCE = None
+def _get_astock_source():
+    global _ASTOCK_SOURCE
+    if _ASTOCK_SOURCE is None:
+        try:
+            from astock_data_source import (
+                get_full_stock_data as _astock_get_full,
+                get_data_health as _astock_health,
+            )
+            # 验证数据是否可用
+            h = _astock_health()
+            if any(v["exists"] for v in h.values()):
+                _ASTOCK_SOURCE = _astock_get_full
+                logging.info(f"  📦 AStock Data Toolkit 数据源可用 ({sum(1 for v in h.values() if v['exists'])}/6 表)")
+            else:
+                logging.info("  📦 AStock Data Toolkit 已安装但尚无本地数据, 跳过")
+                _ASTOCK_SOURCE = False
+        except ImportError:
+            _ASTOCK_SOURCE = False
+    return _ASTOCK_SOURCE if _ASTOCK_SOURCE else None
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [SIG_EXT] %(message)s",
@@ -121,6 +143,15 @@ def run_signal_extract(
         }
     """
     logging.info(f"  📡 SIGNAL_EXTRACT [{stock_code}]")
+
+    # ── AStock Data Toolkit 降级回填 ──
+    if not stock_data or not stock_data.get("close"):
+        astock_fn = _get_astock_source()
+        if astock_fn:
+            astock_data = astock_fn(stock_code)
+            if astock_data:
+                logging.info(f"  📦 从 AStock 回填 [{stock_code}] 数据")
+                stock_data = {**astock_data, **(stock_data or {})}
 
     signals = {
         "tech": extract_tech_signals(stock_data),
