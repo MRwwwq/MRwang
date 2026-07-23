@@ -771,7 +771,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     try:
-        report = run_pre_market_pipeline()
+        report = run_pre_market_pipeline_enhanced()
         print()
         print(f"✅ 开盘前预处理: {report['overall_status']}")
         print(f"   步骤: {report['steps_ok']}/{report['total_steps']}")

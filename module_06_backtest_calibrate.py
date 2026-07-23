@@ -372,9 +372,18 @@ def init_db():
             real_fact TEXT DEFAULT '',
             fix_patch TEXT DEFAULT '',
             notes TEXT DEFAULT '',
-            created_at TEXT DEFAULT (datetime('now'))
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(trade_date, ticker)
         )
     """)
+    # 存量去重迁移：删除同一日期同一标的的重复漏洞记录，仅保留最新一条
+    cur.execute(f"""
+        DELETE FROM {VULN_TABLE} WHERE id NOT IN (
+            SELECT MIN(id) FROM {VULN_TABLE} GROUP BY trade_date, ticker
+        )
+    """)
+    if cur.rowcount > 0:
+        log.info(f"  存量去重: 清理 {cur.rowcount} 条重复漏洞记录")
     cur.execute(f"""
         CREATE TABLE IF NOT EXISTS {BOUNDARY_TABLE} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -527,7 +536,7 @@ def save_vulnerability(trade_date, ticker, vuln_category, vuln_subtype,
     conn = sqlite3.connect(str(MODULE06_DB))
     cur = conn.cursor()
     cur.execute(f"""
-        INSERT INTO {VULN_TABLE}
+        INSERT OR REPLACE INTO {VULN_TABLE}
         (trade_date, ticker, vuln_category, vuln_subtype, severity,
          ai_conclusion, real_fact, fix_patch, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
