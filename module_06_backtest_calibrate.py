@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Module_06_BacktestCalibrate — 盘后样本校准与智能体自修正模块 v1.0
+Module_06_BacktestCalibrate — 盘后样本校准与智能体自修正模块 v1.1
 ================================================================
 核心定位：全链路闭环关键环节，驱动智能体自主修正规则/参数/信号打分权重的唯一数据源
 执行窗口：收盘后，标准时长10分钟
@@ -10,12 +10,18 @@ Module_06_BacktestCalibrate — 盘后样本校准与智能体自修正模块 v1
   2. 智能体盘中原始信号存档完整（含Layer2风控分级、psy_hit_codes心理编码）
   3. 交易者真实操作记录完整
 
+两大核心操作：
+  【操作一】真实交易结果校准（量化误差标签）: 4类标签 L01~L04 + L00正常
+  【操作二】人工研判漏洞修正（补充隐性盲区）: 3类漏洞记录+补丁+等级标记+L1~L3
+
 流程：
-  归集→匹配4类标签→写入样本库→同步回传Layer1/Module01~04/Layer2→生成复盘日志
+  归集→匹配4类标签→记录研判漏洞→写入样本库→同步回传Layer1/Module01~04/Layer2→生成复盘日志
 
 用法:
   python3 module_06_backtest_calibrate.py                          # 交互模式(人工确认标签)
   python3 module_06_backtest_calibrate.py --auto                   # 自动模式(基于预判vs真实行情自动打标)
+  python3 module_06_backtest_calibrate.py --vuln                   # 仅执行漏洞修正操作
+  python3 module_06_backtest_calibrate.py --auto --vuln            # 全自动模式(含自动标记+漏洞修正)
   python3 module_06_backtest_calibrate.py --check-only             # 仅检查今日是否已完成校准
 """
 
@@ -40,6 +46,7 @@ TRACKER_DIR = BASE / "tracker_reports"
 
 CALIB_TABLE = "module06_calibration"
 SYNC_TABLE = "module06_sync_log"
+VULN_TABLE = "module06_vulnerability"  # 研判漏洞记录表
 
 # 交易日（从文件名或系统日期推断）
 TODAY = datetime.now().strftime("%Y-%m-%d")
@@ -84,6 +91,38 @@ LABELS = {
     },
 }
 
+# ═══════════════════════════════════════════
+#  第一类：3类研判漏洞分类
+# ═══════════════════════════════════════════
+
+VULN_CATEGORIES = {
+    "C01": {
+        "name": "信息类盲区",
+        "desc": "智能体无法自动抓取解读的隐性信息",
+        "sub_types": ["突发隐性利空/利好", "小众题材/细分产业逻辑", "盘外舆情/资金隐性动作"],
+        "fix_target": "Layer1_BOW特征词库补充关键词/特征"
+    },
+    "C02": {
+        "name": "规则逻辑类漏洞",
+        "desc": "系统固定规则静态固化，无法自适应行情变化",
+        "sub_types": ["风格适配漏洞", "情绪判定漏洞", "主线判定漏洞"],
+        "fix_target": "Module01~04 风格/情绪/主线参数临时补丁"
+    },
+    "C03": {
+        "name": "风控识别盲区",
+        "desc": "心理偏差/风险信号隐性化，量化指标无剧烈变化",
+        "sub_types": ["隐性情绪化交易风险", "共振风险盲区(缓慢积累Lolla)"],
+        "fix_target": "Layer2 隐性风险触发条件+心理误判场景补充"
+    },
+}
+
+# 漏洞严重等级
+VULN_SEVERITY = {
+    "L1": {"name": "轻度", "desc": "仅小幅影响收益，不产生大幅亏损", "action": "仅更新特征词库"},
+    "L2": {"name": "中度", "desc": "造成单次明显回撤/踏空大行情", "action": "临时修改参数补丁，次日自动迭代调整权重"},
+    "L3": {"name": "重度", "desc": "连续多日规则失效/频繁大幅亏损", "action": "永久固化规则调整，强制收紧全部入场条件"},
+}
+
 
 # ═══════════════════════════════════════════
 #  数据库初始化
@@ -119,6 +158,21 @@ def init_db():
             target_module TEXT NOT NULL,
             sync_action TEXT NOT NULL,
             sync_status TEXT DEFAULT 'pending',
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {VULN_TABLE} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            ticker TEXT DEFAULT '',
+            vuln_category TEXT NOT NULL,
+            vuln_subtype TEXT DEFAULT '',
+            severity TEXT DEFAULT 'L1',
+            ai_conclusion TEXT DEFAULT '',
+            real_fact TEXT DEFAULT '',
+            fix_patch TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -245,6 +299,117 @@ def save_calibration(trade_date: str, ticker: str, stock_name: str,
     log.info(f"  [{label_code}] {ticker} {stock_name} 已写入样本库")
 
 
+# ═══════════════════════════════════════════
+#  操作二：研判漏洞修正
+# ═══════════════════════════════════════════
+
+def save_vulnerability(trade_date, ticker, vuln_category, vuln_subtype,
+                       severity, ai_conclusion, real_fact,
+                       fix_patch="", notes=""):
+    """记录研判漏洞（信息盲区/规则逻辑漏洞/风控盲区）"""
+    conn = sqlite3.connect(str(MODULE06_DB))
+    cur = conn.cursor()
+    cur.execute(f"""
+        INSERT INTO {VULN_TABLE}
+        (trade_date, ticker, vuln_category, vuln_subtype, severity,
+         ai_conclusion, real_fact, fix_patch, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (trade_date, ticker, vuln_category, vuln_subtype, severity,
+          ai_conclusion, real_fact, fix_patch, notes))
+    conn.commit()
+    conn.close()
+    cat_name = VULN_CATEGORIES.get(vuln_category, {}).get("name", vuln_category)
+    sev_name = VULN_SEVERITY.get(severity, {}).get("name", severity)
+    log.info(f"  [漏洞][{severity}][{vuln_category}] {ticker} {cat_name}")
+    return True
+
+
+def sync_vuln_to_modules(trade_date, vuln_category, severity, fix_patch):
+    """漏洞数据回传三大模块"""
+    if vuln_category == "C01":
+        act = f"bow_keyword_patch|{fix_patch[:80]}"
+        record_sync_action(trade_date, "", "Layer1_FeatureCheck", act, "pending")
+        log.info(f"  → Layer1 BOW词库: {act}")
+    elif vuln_category == "C02":
+        act = f"rule_param_patch|{fix_patch[:80]}"
+        record_sync_action(trade_date, "", "Module01_04", act, "pending")
+        log.info(f"  → Module01~04 参数补丁: {act}")
+    elif vuln_category == "C03":
+        act = f"risk_condition_patch|{fix_patch[:80]}"
+        record_sync_action(trade_date, "", "Layer2_RiskDecision", act, "pending")
+        log.info(f"  → Layer2 风控条件补丁: {act}")
+
+
+def record_vuln_and_notify():
+    """交互式记录研判漏洞（人工录入）"""
+    print("\n" + "=" * 60)
+    print("  【操作二】人工研判漏洞修正")
+    print("=" * 60)
+    print("\n漏洞分类:")
+    for cc, ci in VULN_CATEGORIES.items():
+        print(f"  {cc}: {ci['name']} — {ci['desc']}")
+        for st in ci["sub_types"]:
+            print(f"    · {st}")
+    print("\n严重等级: L1(轻度) L2(中度) L3(重度)")
+    print("(输入 q 结束漏洞记录)")
+    print("-" * 40)
+
+    while True:
+        ticker = input("\n漏洞标的/板块(留空跳过): ").strip()
+        if not ticker or ticker.lower() == 'q':
+            break
+        ai_conc = input("智能体原有研判结论: ").strip()
+        real_fact = input("真实市场事实/隐性信息: ").strip()
+        print("漏洞类型: C01信息盲区 C02规则逻辑漏洞 C03风控盲区")
+        cat = input("漏洞类型: ").strip().upper()
+        while cat not in VULN_CATEGORIES:
+            if cat.lower() == 'q':
+                return
+            cat = input("无效, 请选 C01/C02/C03: ").strip().upper()
+        sev = input("严重等级(L1/L2/L3): ").strip().upper()
+        while sev not in VULN_SEVERITY:
+            sev = input("无效, 请选 L1/L2/L3: ").strip().upper()
+        patch = input("人工补丁描述: ").strip()
+        save_vulnerability(TRADE_DATE, ticker, cat, "", sev, ai_conc, real_fact, patch)
+        sync_vuln_to_modules(TRADE_DATE, cat, sev, patch)
+        print(f"  ✅ [{sev}] {ticker} 漏洞已记录+回传")
+
+
+def generate_vuln_log(trade_date):
+    """生成漏洞修正复盘日志"""
+    conn = sqlite3.connect(str(MODULE06_DB))
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT ticker, vuln_category, severity, ai_conclusion, real_fact, fix_patch
+        FROM {VULN_TABLE} WHERE trade_date = ? ORDER BY id
+    """, (trade_date,))
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        return ""
+    lines = [
+        "",
+        "### 操作二：研判漏洞修正记录",
+        "",
+        "| 标的 | 漏洞类型 | 等级 | AI研判 | 真实事实 | 人工补丁 |",
+        "|:----:|:--------:|:----:|:-------|:---------|:---------|",
+    ]
+    cats = {}
+    for r in rows:
+        ticker, cat, sev, ai_c, real, patch = r
+        cn = VULN_CATEGORIES.get(cat, {}).get("name", cat)
+        sn = VULN_SEVERITY.get(sev, {}).get("name", sev)
+        lines.append(f"| {ticker} | {cn} | {sn} | {ai_c[:40]} | {real[:40]} | {patch[:40]} |")
+        cats[cat] = cats.get(cat, 0) + 1
+    lines += ["", "**漏洞分类统计:**"]
+    for c, n in cats.items():
+        lines.append(f"- {VULN_CATEGORIES.get(c,{}).get('name',c)}: {n}条")
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════
+#  工具函数
+# ═══════════════════════════════════════════
 def record_sync_action(trade_date: str, ticker: str, target_module: str,
                        sync_action: str, status: str = "pending"):
     """记录数据同步事件（回传Layer1/Module/Layer2）"""
@@ -310,10 +475,13 @@ def generate_calibration_log(trade_date: str):
     conn.close()
 
     lines = [
-        f"## Module_06 盘后校准日志 — {trade_date}",
         "",
-        f"| 标的 | 名称 | 标签 | AI预判 | 真实涨跌 | 操作 | 备注 |",
-        f"|:----:|:----:|:----:|:------:|:--------:|:----:|:-----|",
+        f"### Module_06 盘后校准日志 — {trade_date}",
+        "",
+        "#### 操作一：真实交易结果校准（量化误差标签）",
+        "",
+        "| 标的 | 名称 | 标签 | AI预判 | 真实涨跌 | 操作 | 备注 |",
+        "|:----:|:----:|:----:|:------:|:--------:|:----:|:-----|",
     ]
     label_counts = {}
     for r in rows:
@@ -343,6 +511,32 @@ def generate_calibration_log(trade_date: str):
         lines.append("")
         lines.append(f"⚠️ **完整性校验：{len(missing)}只缺失标注 — {missing}**")
 
+    # 追加漏洞修正日志
+    vuln_log = generate_vuln_log(trade_date)
+    if vuln_log:
+        lines.append(vuln_log)
+
+    # 完整盘后清单
+    lines += [
+        "",
+        "---",
+        "### 完整盘后操作清单",
+        "",
+        "| # | 操作项 | 录入内容 | 完成✅ |",
+        "|:-:|:-------|:---------|:----:|",
+        "| 1 | 全标的行情录入 | 每只真实涨跌、支撑压力突破结果 | ✅ |",
+        "| 2 | 真实操作记录 | 持仓/止盈/止损/空仓全部操作 | ✅ |",
+        "| 3 | 标签① | AI预判涨实际大跌→[L01]预判高估，负误差 | □ |",
+        "| 4 | 标签② | AI预判跌实际大涨→[L02]预判低估，负误差 | □ |",
+        "| 5 | 标签③ | 风控提示减仓后持续大跌→[L03]风控判断有效 | □ |",
+        "| 6 | 标签④ | 满足入场开仓后被套→[L04]入场条件失效 | □ |",
+        "| 7 | 研判漏洞完整记录 | 填写标的/研判/事实/漏洞分类 | □ |",
+        "| 8 | 人工补丁录入 | 补充特征词/调整参数/新增风控条件 | □ |",
+        "| 9 | 漏洞等级标记 | L1轻度/L2中度/L3重度 | □ |",
+        "| 10 | 样本库同步归档 | 漏洞与误差标签合并入库 | ✅ |",
+        "| 11 | 自动迭代触发 | 样本回传Layer1/交易模块/Layer2 | ✅ |",
+    ]
+
     return "\n".join(lines)
 
 
@@ -370,6 +564,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Module_06 盘后样本校准与智能体自修正")
     parser.add_argument("--auto", action="store_true", help="自动模式(基于预判vs真实行情自动打标)")
+    parser.add_argument("--vuln", action="store_true", help="执行研判漏洞修正操作")
     parser.add_argument("--check-only", action="store_true", help="仅检查今日是否已完成校准")
     args = parser.parse_args()
 
@@ -380,6 +575,19 @@ def main():
             print("✅ 前5日内存在校准记录，可正常开仓")
         else:
             print("❌ 前5日内无校准记录，禁止开仓（请先运行 Module_06）")
+        return
+
+    # 仅漏洞修正模式
+    if args.vuln and not args.auto:
+        init_db()
+        print(f"{'='*60}")
+        print(f"  Module_06 【操作二】人工研判漏洞修正")
+        print(f"  交易日: {TRADE_DATE}")
+        print(f"{'='*60}")
+        record_vuln_and_notify()
+        print(f"\n{'='*60}")
+        print(f"  【操作二】完成")
+        print(f"{'='*60}")
         return
 
     print(f"{'='*60}")
@@ -469,6 +677,13 @@ def main():
     prev_ok = check_prev_day_complete()
     if not prev_ok:
         print("\n⚠️ 警告：前5日无校准记录，下次运行交易系统前先完成 Module_06")
+
+    # 7. 如果同时指定 --vuln，执行操作二
+    if args.vuln:
+        print("\n" + "=" * 60)
+        print("  【操作二】人工研判漏洞修正")
+        print("=" * 60)
+        record_vuln_and_notify()
 
     print(f"\n{'='*60}")
     print(f"  Module_06 完成")
