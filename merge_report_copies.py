@@ -161,10 +161,12 @@ def merge_two_md(path_a: Path, path_b: Path, output_path: Path) -> str:
 
     # 如果一个文件无效, 直接保留有效文件
     if score_a["size"] == 0 and score_b["size"] > 0:
-        shutil.copy2(str(path_b), str(output_path))
+        if path_b.resolve() != output_path.resolve():
+            shutil.copy2(str(path_b), str(output_path))
         return "keep_b"
     if score_b["size"] == 0 and score_a["size"] > 0:
-        shutil.copy2(str(path_a), str(output_path))
+        if path_a.resolve() != output_path.resolve():
+            shutil.copy2(str(path_a), str(output_path))
         return "keep_a"
     if score_a["size"] == 0 and score_b["size"] == 0:
         return "both_empty"
@@ -192,7 +194,8 @@ def merge_two_md(path_a: Path, path_b: Path, output_path: Path) -> str:
 
     if not new_lines:
         # 无新增内容, 直接保留主版本
-        shutil.copy2(str(primary), str(output_path))
+        if primary.resolve() != output_path.resolve():
+            shutil.copy2(str(primary), str(output_path))
         return f"keep_{primary_name}"
 
     # 合并: 在主版本末尾追加补充行
@@ -265,8 +268,9 @@ def main():
         # 合并
         result = merge_two_md(local_path, feishu_path, local_path)
 
-        # 同步更新飞书副本
-        shutil.copy2(str(local_path), str(feishu_path))
+        # 同步更新飞书副本(仅当路径不同)
+        if local_path.resolve() != feishu_path.resolve():
+            shutil.copy2(str(local_path), str(feishu_path))
 
         logger.info(f"    → 合并结果: {result} | 已同步至飞书副本")
         merged_count += 1
